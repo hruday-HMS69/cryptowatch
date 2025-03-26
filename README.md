@@ -44,3 +44,38 @@ cd cryptowatch-terminal
 
 # Build and run
 cargo run --release
+
+
+🌟 Future Roadmap
+Planned Features
+🔜 Multi-Exchange Support
+
+Coinbase Pro integration
+
+Kraken API support
+
+Arbitrage detection
+
+🔜 Enhanced Trading
+
+Limit/Market orders
+
+Stop-loss/take-profit
+
+Order history tracking
+
+🔜 Advanced Analytics
+
+Backtesting engine
+
+Strategy builder
+
+Candlestick charts
+
+🔜 UI Improvements
+
+Customizable themes
+
+Multiple layout modes
+
+Exportable reports
