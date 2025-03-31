@@ -11,7 +11,6 @@ A real-time cryptocurrency market monitor and trading dashboard built with Rust,
 - 🔍 Technical indicators (RSI, MACD)
 - ⌨️ Keyboard-driven TUI interface
 
-![Dashboard Screenshot](screenshot.png) *(Example: Replace with actual screenshot)*
 
 ## Features
 
