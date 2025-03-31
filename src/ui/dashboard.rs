@@ -1,6 +1,6 @@
 use chrono::Local;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -12,17 +12,28 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::error::Error;
 use std::io;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use ta::{
+    indicators::{
+        BollingerBands, ExponentialMovingAverage, MovingAverageConvergenceDivergence,
+        RelativeStrengthIndex, SimpleMovingAverage,
+    },
+    Next,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+type DynError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardView {
     Prices,
     Alerts,
     Portfolio,
     Exchanges,
     Indicators,
+    Chart,
 }
 
 #[derive(Debug, Clone)]
@@ -31,13 +42,7 @@ pub enum AlertCondition {
     PriceBelow(f64),
     ChangeAbove(f64),
     ChangeBelow(f64),
-    IndicatorCross { indicator: String, value: f64, direction: CrossDirection },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CrossDirection {
-    Above,
-    Below,
+    IndicatorCross(String, f64),
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +53,7 @@ pub struct Alert {
     pub active: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exchange {
     Binance,
     Coinbase,
@@ -56,7 +61,7 @@ pub enum Exchange {
 }
 
 #[derive(Debug, Clone)]
-struct PriceData {
+pub struct PriceData {
     pub price: f64,
     pub volume: f64,
     pub timestamp: i64,
@@ -64,34 +69,96 @@ struct PriceData {
 }
 
 #[derive(Debug, Clone)]
+pub struct IndicatorData {
+    pub sma_20: Option<f64>,
+    pub ema_20: Option<f64>,
+    pub rsi_14: Option<f64>,
+    pub macd: Option<f64>,
+    pub macd_signal: Option<f64>,
+    pub bollinger_upper: Option<f64>,
+    pub bollinger_lower: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolData {
+    pub prices: VecDeque<PriceData>,
+    pub indicators: IndicatorData,
+}
+
+impl SymbolData {
+    pub fn new() -> Self {
+        Self {
+            prices: VecDeque::new(),
+            indicators: IndicatorData {
+                sma_20: None,
+                ema_20: None,
+                rsi_14: None,
+                macd: None,
+                macd_signal: None,
+                bollinger_upper: None,
+                bollinger_lower: None,
+            },
+        }
+    }
+
+    pub fn update_indicators(&mut self) {
+        if self.prices.len() < 20 {
+            return;
+        }
+
+        let prices: Vec<f64> = self.prices.iter().map(|p| p.price).collect();
+
+        // SMA 20
+        let mut sma = SimpleMovingAverage::new(20).unwrap();
+        self.indicators.sma_20 = prices.iter().fold(None, |_, &p| Some(sma.next(p)));
+
+        // EMA 20
+        let mut ema = ExponentialMovingAverage::new(20).unwrap();
+        self.indicators.ema_20 = prices.iter().fold(None, |_, &p| Some(ema.next(p)));
+
+        // RSI 14
+        let mut rsi = RelativeStrengthIndex::new(14).unwrap();
+        self.indicators.rsi_14 = prices.iter().fold(None, |_, &p| Some(rsi.next(p)));
+
+        // MACD
+        let mut macd = MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap();
+        let macd_output = prices.iter().fold(None, |_, &p| Some(macd.next(p)));
+        if let Some(macd_output) = macd_output {
+            self.indicators.macd = Some(macd_output.macd);
+            self.indicators.macd_signal = Some(macd_output.signal);
+        }
+
+        // Bollinger Bands
+        let mut bb = BollingerBands::new(20, 2.0).unwrap();
+        let bb_output = prices.iter().fold(None, |_, &p| Some(bb.next(p)));
+        if let Some(bb_output) = bb_output {
+            self.indicators.bollinger_upper = Some(bb_output.upper);
+            self.indicators.bollinger_lower = Some(bb_output.lower);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Portfolio {
     pub holdings: HashMap<String, f64>,
     pub initial_value: f64,
     pub cash: f64,
+    pub trade_history: Vec<Trade>,
 }
 
 #[derive(Debug, Clone)]
-pub struct TechnicalIndicators {
-    pub sma: HashMap<usize, Vec<f64>>,
-    pub rsi: HashMap<usize, Vec<f64>>,
-    pub macd: HashMap<(usize, usize, usize), MacdData>,
+pub struct Trade {
+    pub symbol: String,
+    pub quantity: f64,
+    pub price: f64,
+    pub timestamp: i64,
+    pub trade_type: TradeType,
 }
 
-#[derive(Debug, Clone)]
-pub struct MacdData {
-    pub macd_line: Vec<f64>,
-    pub signal_line: Vec<f64>,
-    pub histogram: Vec<f64>,
-}
-
-impl TechnicalIndicators {
-    pub fn new() -> Self {
-        Self {
-            sma: HashMap::new(),
-            rsi: HashMap::new(),
-            macd: HashMap::new(),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeType {
+    Buy,
+    Sell,
 }
 
 impl Portfolio {
@@ -100,47 +167,107 @@ impl Portfolio {
             holdings: HashMap::new(),
             initial_value: initial_cash,
             cash: initial_cash,
+            trade_history: Vec::new(),
         }
     }
 
-    pub fn current_value(&self, prices: &HashMap<String, Vec<PriceData>>) -> f64 {
-        self.holdings.iter().fold(0.0, |acc, (symbol, qty)| {
-            prices.get(symbol)
-                .and_then(|prices| prices.first())
-                .map(|price_data| price_data.price * qty)
-                .unwrap_or(0.0) + acc
-        }) + self.cash
+    pub fn current_value(&self, prices: &HashMap<String, SymbolData>) -> f64 {
+        self.holdings
+            .iter()
+            .fold(0.0, |acc, (symbol, qty)| {
+                prices
+                    .get(symbol)
+                    .and_then(|data| data.prices.back())
+                    .map(|price_data| price_data.price * qty)
+                    .unwrap_or(0.0)
+                    + acc
+            })
+            + self.cash
     }
 
-    pub fn profit_loss(&self, prices: &HashMap<String, Vec<PriceData>>) -> f64 {
+    pub fn profit_loss(&self, prices: &HashMap<String, SymbolData>) -> f64 {
         self.current_value(prices) - self.initial_value
+    }
+
+    pub fn buy(&mut self, symbol: &str, amount: f64, price: f64) -> Result<(), String> {
+        let cost = amount * price;
+        if cost > self.cash {
+            return Err("Insufficient funds".to_string());
+        }
+
+        self.cash -= cost;
+        *self.holdings.entry(symbol.to_string()).or_insert(0.0) += amount;
+
+        self.trade_history.push(Trade {
+            symbol: symbol.to_string(),
+            quantity: amount,
+            price,
+            timestamp: Local::now().timestamp(),
+            trade_type: TradeType::Buy,
+        });
+
+        Ok(())
+    }
+
+    pub fn sell(&mut self, symbol: &str, amount: f64, price: f64) -> Result<(), String> {
+        let current_amount = *self.holdings.get(symbol).unwrap_or(&0.0);
+        if amount > current_amount {
+            return Err("Insufficient holdings".to_string());
+        }
+
+        self.cash += amount * price;
+        *self.holdings.get_mut(symbol).unwrap() -= amount;
+
+        if self.holdings[symbol] <= 0.0001 {
+            self.holdings.remove(symbol);
+        }
+
+        self.trade_history.push(Trade {
+            symbol: symbol.to_string(),
+            quantity: amount,
+            price,
+            timestamp: Local::now().timestamp(),
+            trade_type: TradeType::Sell,
+        });
+
+        Ok(())
     }
 }
 
+#[derive(Clone)]
 pub struct Dashboard {
-    pub prices: HashMap<String, Vec<PriceData>>,
-    pub selected: usize,
-    pub sort_column: usize,
-    pub sort_ascending: bool,
-    pub alerts: Vec<Alert>,
-    pub portfolio: Portfolio,
-    pub current_view: DashboardView,
+    pub prices: Arc<Mutex<HashMap<String, SymbolData>>>,
+    pub selected: Arc<Mutex<usize>>,
+    pub sort_column: Arc<Mutex<usize>>,
+    pub sort_ascending: Arc<Mutex<bool>>,
+    pub alerts: Arc<Mutex<Vec<Alert>>>,
+    pub portfolio: Arc<Mutex<Portfolio>>,
+    pub current_view: Arc<Mutex<DashboardView>>,
     pub price_history_length: usize,
-    pub indicators: TechnicalIndicators,
-    pub indicator_periods: Vec<usize>,
-    pub selected_indicator: usize,
-    pub show_indicators: bool,
-    pub initialized: bool,
+    pub running: Arc<Mutex<bool>>,
+    pub selected_timeframe: Arc<Mutex<Timeframe>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timeframe {
+    M1,
+    M5,
+    M15,
+    M30,
+    H1,
+    H4,
+    D1,
+    W1,
 }
 
 impl Dashboard {
     pub fn new(initial_cash: f64) -> Self {
         Self {
-            prices: HashMap::new(),
-            selected: 0,
-            sort_column: 0,
-            sort_ascending: false,
-            alerts: vec![
+            prices: Arc::new(Mutex::new(HashMap::new())),
+            selected: Arc::new(Mutex::new(0)),
+            sort_column: Arc::new(Mutex::new(0)),
+            sort_ascending: Arc::new(Mutex::new(false)),
+            alerts: Arc::new(Mutex::new(vec![
                 Alert {
                     symbol: "BTCUSDT".to_string(),
                     condition: AlertCondition::PriceAbove(90000.0),
@@ -153,21 +280,19 @@ impl Dashboard {
                     triggered: false,
                     active: true,
                 },
-            ],
-            portfolio: Portfolio::new(initial_cash),
-            current_view: DashboardView::Prices,
-            price_history_length: 50,
-            indicators: TechnicalIndicators::new(),
-            indicator_periods: vec![7, 14, 21, 50, 200],
-            selected_indicator: 0,
-            show_indicators: false,
-            initialized: false,
+            ])),
+            portfolio: Arc::new(Mutex::new(Portfolio::new(initial_cash))),
+            current_view: Arc::new(Mutex::new(DashboardView::Prices)),
+            price_history_length: 100,
+            running: Arc::new(Mutex::new(true)),
+            selected_timeframe: Arc::new(Mutex::new(Timeframe::M1)),
         }
     }
 
     pub async fn run(
-        mut receiver: mpsc::Receiver<(String, String, String)>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        &self,
+        mut receiver: tokio::sync::mpsc::Receiver<(String, String, String)>,
+    ) -> Result<(), DynError> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -175,58 +300,34 @@ impl Dashboard {
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        let mut dashboard = Self::new(10000.0);
-        let mut last_render_time = Local::now();
-
-        loop {
+        while *self.running.lock().unwrap() {
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Char('p') => dashboard.current_view = DashboardView::Portfolio,
-                        KeyCode::Char('a') => dashboard.current_view = DashboardView::Alerts,
-                        KeyCode::Char('e') => dashboard.current_view = DashboardView::Exchanges,
-                        KeyCode::Char('v') => dashboard.current_view = DashboardView::Prices,
-                        KeyCode::Char('i') => dashboard.current_view = DashboardView::Indicators,
-                        KeyCode::Char('t') => dashboard.show_indicators = !dashboard.show_indicators,
-                        KeyCode::Up => {
-                            if dashboard.current_view == DashboardView::Indicators {
-                                dashboard.selected_indicator = dashboard.selected_indicator.saturating_sub(1);
-                            } else {
-                                dashboard.selected = dashboard.selected.saturating_sub(1);
-                            }
-                        },
-                        KeyCode::Down => {
-                            if dashboard.current_view == DashboardView::Indicators {
-                                dashboard.selected_indicator = (dashboard.selected_indicator + 1)
-                                    .min(dashboard.indicator_periods.len() - 1);
-                            } else {
-                                dashboard.selected = dashboard.selected.saturating_add(1);
-                            }
-                        },
-                        KeyCode::Char('s') => {
-                            dashboard.sort_column = (dashboard.sort_column + 1) % 3;
-                            dashboard.sort_ascending = !dashboard.sort_ascending;
-                        }
-                        _ => {}
-                    }
+                    self.handle_key_input(key).await?;
                 }
             }
 
             while let Ok((symbol, price, change)) = receiver.try_recv() {
-                dashboard.update_price(&symbol, &price, &change);
-                if dashboard.prices.values().next().map(|v| v.len()).unwrap_or(0) > 14 {
-                    dashboard.initialized = true;
-                    dashboard.check_alerts(&symbol);
+                if let Err(e) = self.update_price(&symbol, &price, &change).await {
+                    log::error!("Error updating price for {}: {}", symbol, e);
                 }
+                self.check_alerts(&symbol).await?;
             }
 
-            // Throttle rendering to avoid high CPU usage
-            let now = Local::now();
-            if (now - last_render_time).num_milliseconds() > 100 {
-                terminal.draw(|f| dashboard.render(f))?;
-                last_render_time = now;
-            }
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(5),
+                        Constraint::Length(3),
+                    ])
+                    .split(f.size());
+
+                self.render_header(f, chunks[0]);
+                self.render_main_content(f, chunks[1]);
+                self.render_footer(f, chunks[2]);
+            })?;
         }
 
         disable_raw_mode()?;
@@ -234,9 +335,103 @@ impl Dashboard {
         Ok(())
     }
 
-    fn update_price(&mut self, symbol: &str, price: &str, change: &str) {
-        let price_num = price.parse::<f64>().unwrap_or(0.0);
-        let _change_num = change.parse::<f64>().unwrap_or(0.0);
+    async fn handle_key_input(&self, key: KeyEvent) -> Result<(), DynError> {
+        match key.code {
+            KeyCode::Char('q') => *self.running.lock().unwrap() = false,
+            KeyCode::Char('p') => *self.current_view.lock().unwrap() = DashboardView::Portfolio,
+            KeyCode::Char('a') => *self.current_view.lock().unwrap() = DashboardView::Alerts,
+            KeyCode::Char('e') => *self.current_view.lock().unwrap() = DashboardView::Exchanges,
+            KeyCode::Char('i') => *self.current_view.lock().unwrap() = DashboardView::Indicators,
+            KeyCode::Char('c') => *self.current_view.lock().unwrap() = DashboardView::Chart,
+            KeyCode::Char('v') => *self.current_view.lock().unwrap() = DashboardView::Prices,
+            KeyCode::Up => {
+                let mut selected = self.selected.lock().unwrap();
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let mut selected = self.selected.lock().unwrap();
+                *selected = selected.saturating_add(1);
+            }
+            KeyCode::Char('s') => {
+                let mut sort_column = self.sort_column.lock().unwrap();
+                *sort_column = (*sort_column + 1) % 3;
+                let mut sort_ascending = self.sort_ascending.lock().unwrap();
+                *sort_ascending = !*sort_ascending;
+            }
+            KeyCode::Char('t') => {
+                let mut timeframe = self.selected_timeframe.lock().unwrap();
+                *timeframe = match *timeframe {
+                    Timeframe::M1 => Timeframe::M5,
+                    Timeframe::M5 => Timeframe::M15,
+                    Timeframe::M15 => Timeframe::M30,
+                    Timeframe::M30 => Timeframe::H1,
+                    Timeframe::H1 => Timeframe::H4,
+                    Timeframe::H4 => Timeframe::D1,
+                    Timeframe::D1 => Timeframe::W1,
+                    Timeframe::W1 => Timeframe::M1,
+                };
+            }
+            KeyCode::Char('b') => {
+                let prices = self.prices.lock().unwrap();
+                let selected = *self.selected.lock().unwrap();
+                if let Some(symbol) = prices.keys().nth(selected) {
+                    let mut portfolio = self.portfolio.lock().unwrap();
+                    if let Some(data) = prices.get(symbol) {
+                        if let Some(price_data) = data.prices.back() {
+                            let amount = 0.1;
+                            let price = price_data.price;
+                            if let Err(e) = portfolio.buy(symbol, amount, price) {
+                                log::error!("Buy error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                let prices = self.prices.lock().unwrap();
+                let selected = *self.selected.lock().unwrap();
+                if let Some(symbol) = prices.keys().nth(selected) {
+                    let mut portfolio = self.portfolio.lock().unwrap();
+                    if let Some(data) = prices.get(symbol) {
+                        if let Some(price_data) = data.prices.back() {
+                            let amount = 0.1;
+                            let price = price_data.price;
+                            if let Err(e) = portfolio.sell(symbol, amount, price) {
+                                log::error!("Sell error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn update_price(
+        &self,
+        symbol: &str,
+        price: &str,
+        change: &str,
+    ) -> Result<(), DynError> {
+        
+        if price.trim().is_empty() {
+            log::warn!("Empty price received for {}", symbol);
+            return Ok(());
+        }
+
+        // Parse price with error handling
+        let price_num = match price.parse::<f64>() {
+            Ok(num) => num,
+            Err(e) => {
+                log::error!("Failed to parse price '{}' for {}: {}", price, symbol, e);
+                return Ok(()); // Skip this update but keep running
+            }
+        };
+
+        
+        let change_num = change.parse::<f64>().unwrap_or(0.0);
+
         let timestamp = Local::now().timestamp();
 
         let price_data = PriceData {
@@ -246,232 +441,83 @@ impl Dashboard {
             exchange: Exchange::Binance,
         };
 
-        self.prices
-            .entry(symbol.to_string())
-            .or_insert_with(Vec::new)
-            .push(price_data);
+        let mut prices = self.prices.lock().unwrap();
+        let symbol_data = prices
+            .entry(symbol.to_uppercase())
+            .or_insert_with(SymbolData::new);
 
-        if let Some(prices) = self.prices.get_mut(symbol) {
-            if prices.len() > self.price_history_length {
-                prices.remove(0);
-            }
+        symbol_data.prices.push_back(price_data);
+        if symbol_data.prices.len() > self.price_history_length {
+            symbol_data.prices.pop_front();
         }
 
-        if self.initialized {
-            self.calculate_indicators();
-        }
+        symbol_data.update_indicators();
+
+        Ok(())
     }
 
-    fn calculate_indicators(&mut self) {
-        for (_symbol, prices) in &self.prices {
-            if prices.len() < 15 { // Minimum data points needed for calculations
+    async fn check_alerts(&self, symbol: &str) -> Result<(), DynError> {
+        let prices = self.prices.lock().unwrap();
+        let symbol_data = match prices.get(&symbol.to_uppercase()) {
+            Some(data) => data,
+            None => return Ok(()),
+        };
+
+        let price_data = match symbol_data.prices.back() {
+            Some(data) => data,
+            None => return Ok(()),
+        };
+
+        let mut alerts = self.alerts.lock().unwrap();
+        for alert in alerts.iter_mut() {
+            if alert.symbol != symbol.to_uppercase() || !alert.active {
                 continue;
             }
 
-            let price_values: Vec<f64> = prices.iter().map(|p| p.price).collect();
-
-            for &period in &self.indicator_periods {
-                let sma = self.calculate_sma(&price_values, period);
-                self.indicators.sma.insert(period, sma);
-            }
-
-            for &period in &self.indicator_periods {
-                let rsi = self.calculate_rsi(&price_values, period);
-                self.indicators.rsi.insert(period, rsi);
-            }
-
-            let macd_data = self.calculate_macd(&price_values, 12, 26, 9);
-            self.indicators.macd.insert((12, 26, 9), macd_data);
-        }
-    }
-
-    fn calculate_sma(&self, prices: &[f64], period: usize) -> Vec<f64> {
-        if prices.len() < period {
-            return vec![0.0; prices.len()];
-        }
-
-        let mut sma = Vec::with_capacity(prices.len());
-        for i in 0..prices.len() {
-            if i < period - 1 {
-                sma.push(0.0);
-            } else {
-                let sum: f64 = prices[i - period + 1..=i].iter().sum();
-                sma.push(sum / period as f64);
-            }
-        }
-        sma
-    }
-
-    fn calculate_rsi(&self, prices: &[f64], period: usize) -> Vec<f64> {
-        if prices.len() <= period {
-            return vec![0.0; prices.len()];
-        }
-
-        let mut gains = Vec::new();
-        let mut losses = Vec::new();
-
-        for i in 1..prices.len() {
-            let change = prices[i] - prices[i - 1];
-            if change > 0.0 {
-                gains.push(change);
-                losses.push(0.0);
-            } else {
-                gains.push(0.0);
-                losses.push(change.abs());
-            }
-        }
-
-        let mut avg_gain = gains[0..period].iter().sum::<f64>() / period as f64;
-        let mut avg_loss = losses[0..period].iter().sum::<f64>() / period as f64;
-
-        let mut rsi = vec![0.0; period];
-        if avg_loss == 0.0 {
-            rsi.push(100.0);
-        } else {
-            let rs = avg_gain / avg_loss;
-            rsi.push(100.0 - (100.0 / (1.0 + rs)));
-        }
-
-        for i in period..gains.len() {
-            avg_gain = (avg_gain * (period - 1) as f64 + gains[i]) / period as f64;
-            avg_loss = (avg_loss * (period - 1) as f64 + losses[i]) / period as f64;
-
-            if avg_loss == 0.0 {
-                rsi.push(100.0);
-            } else {
-                let rs = avg_gain / avg_loss;
-                rsi.push(100.0 - (100.0 / (1.0 + rs)));
-            }
-        }
-
-        let mut full_rsi = vec![0.0; prices.len() - rsi.len()];
-        full_rsi.extend(rsi);
-        full_rsi
-    }
-
-    fn calculate_macd(&self, prices: &[f64], fast: usize, slow: usize, signal: usize) -> MacdData {
-        let fast_ema = self.calculate_ema(prices, fast);
-        let slow_ema = self.calculate_ema(prices, slow);
-
-        let macd_line: Vec<f64> = fast_ema.iter().zip(&slow_ema)
-            .map(|(f, s)| f - s)
-            .collect();
-
-        let signal_line = self.calculate_ema(&macd_line[slow - fast..], signal);
-
-        let histogram: Vec<f64> = macd_line[slow - fast + signal - 1..].iter()
-            .zip(&signal_line)
-            .map(|(m, s)| m - s)
-            .collect();
-
-        let pad_len = prices.len() - macd_line.len();
-        let mut full_macd_line = vec![0.0; pad_len];
-        full_macd_line.extend(macd_line);
-
-        let pad_len = prices.len() - signal_line.len();
-        let mut full_signal_line = vec![0.0; pad_len];
-        full_signal_line.extend(signal_line);
-
-        let pad_len = prices.len() - histogram.len();
-        let mut full_histogram = vec![0.0; pad_len];
-        full_histogram.extend(histogram);
-
-        MacdData {
-            macd_line: full_macd_line,
-            signal_line: full_signal_line,
-            histogram: full_histogram,
-        }
-    }
-
-    fn calculate_ema(&self, prices: &[f64], period: usize) -> Vec<f64> {
-        if prices.len() < period {
-            return vec![0.0; prices.len()];
-        }
-
-        let mut ema = Vec::with_capacity(prices.len());
-        let multiplier = 2.0 / (period as f64 + 1.0);
-
-        let first_sma: f64 = prices[0..period].iter().sum::<f64>() / period as f64;
-        ema.push(first_sma);
-
-        for i in period..prices.len() {
-            let current_ema = (prices[i] - ema.last().unwrap()) * multiplier + ema.last().unwrap();
-            ema.push(current_ema);
-        }
-
-        let mut full_ema = vec![0.0; prices.len() - ema.len()];
-        full_ema.extend(ema);
-        full_ema
-    }
-
-    fn check_alerts(&mut self, symbol: &str) {
-        if let Some(price_data) = self.prices.get(symbol).and_then(|p| p.last()) {
-            for alert in &mut self.alerts {
-                if alert.symbol == *symbol && alert.active {
-                    let should_trigger = match &alert.condition {
-                        AlertCondition::PriceAbove(threshold) => price_data.price > *threshold,
-                        AlertCondition::PriceBelow(threshold) => price_data.price < *threshold,
-                        AlertCondition::ChangeAbove(threshold) => {
-                            if let Some(prices) = self.prices.get(symbol) {
-                                if prices.len() >= 2 {
-                                    let prev_price = prices[prices.len() - 2].price;
-                                    let change = (price_data.price - prev_price) / prev_price * 100.0;
-                                    change > *threshold
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                        AlertCondition::ChangeBelow(threshold) => {
-                            if let Some(prices) = self.prices.get(symbol) {
-                                if prices.len() >= 2 {
-                                    let prev_price = prices[prices.len() - 2].price;
-                                    let change = (price_data.price - prev_price) / prev_price * 100.0;
-                                    change < *threshold
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                        AlertCondition::IndicatorCross { indicator, value, direction } => {
-                            let indicator_value = match indicator.to_lowercase().as_str() {
-                                "sma" => self.indicators.sma.get(&14).and_then(|v| v.last()).copied().unwrap_or(0.0),
-                                "rsi" => self.indicators.rsi.get(&14).and_then(|v| v.last()).copied().unwrap_or(0.0),
-                                "macd" => self.indicators.macd.get(&(12, 26, 9)).and_then(|m| m.macd_line.last()).copied().unwrap_or(0.0),
-                                _ => 0.0,
-                            };
-                            match direction {
-                                CrossDirection::Above => indicator_value > *value,
-                                CrossDirection::Below => indicator_value < *value,
-                            }
-                        }
-                    };
-                    alert.triggered = should_trigger;
+            let should_trigger = match &alert.condition {
+                AlertCondition::PriceAbove(threshold) => price_data.price > *threshold,
+                AlertCondition::PriceBelow(threshold) => price_data.price < *threshold,
+                AlertCondition::ChangeAbove(threshold) => {
+                    if symbol_data.prices.len() >= 2 {
+                        let prev_price = symbol_data.prices[symbol_data.prices.len() - 2].price;
+                        let change = (price_data.price - prev_price) / prev_price * 100.0;
+                        change > *threshold
+                    } else {
+                        false
+                    }
                 }
-            }
+                AlertCondition::ChangeBelow(threshold) => {
+                    if symbol_data.prices.len() >= 2 {
+                        let prev_price = symbol_data.prices[symbol_data.prices.len() - 2].price;
+                        let change = (price_data.price - prev_price) / prev_price * 100.0;
+                        change < *threshold
+                    } else {
+                        false
+                    }
+                }
+                AlertCondition::IndicatorCross(indicator, threshold) => {
+                    match indicator.as_str() {
+                        "RSI" => symbol_data.indicators.rsi_14.map_or(false, |rsi| rsi > *threshold),
+                        "MACD" => symbol_data
+                            .indicators
+                            .macd
+                            .zip(symbol_data.indicators.macd_signal)
+                            .map_or(false, |(macd, signal)| macd > signal),
+                        "BB" => price_data.price > symbol_data.indicators.bollinger_upper.unwrap_or(0.0)
+                            || price_data.price < symbol_data.indicators.bollinger_lower.unwrap_or(0.0),
+                        _ => false,
+                    }
+                }
+            };
+            alert.triggered = should_trigger;
         }
-    }
-
-    fn render(&mut self, f: &mut Frame<CrosstermBackend<io::Stdout>>) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(5),
-                Constraint::Length(3),
-            ])
-            .split(f.size());
-
-        self.render_header(f, chunks[0]);
-        self.render_main_content(f, chunks[1]);
-        self.render_footer(f, chunks[2]);
+        Ok(())
     }
 
     fn render_header(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let portfolio = self.portfolio.lock().unwrap();
+        let prices = self.prices.lock().unwrap();
+
         let header = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
                 "CRYPTOWATCH DASHBOARD",
@@ -481,11 +527,11 @@ impl Dashboard {
             )),
             Line::from(Span::styled(
                 format!(
-                    "Last update: {} | Portfolio: ${:.2} | P/L: {:.2}% | Indicators: {}",
+                    "Last update: {} | Portfolio: ${:.2} | P/L: {:.2}% | Timeframe: {:?}",
                     Local::now().format("%H:%M:%S"),
-                    self.portfolio.current_value(&self.prices),
-                    self.portfolio.profit_loss(&self.prices) / self.portfolio.initial_value * 100.0,
-                    if self.show_indicators { "ON" } else { "OFF" }
+                    portfolio.current_value(&prices),
+                    portfolio.profit_loss(&prices) / portfolio.initial_value * 100.0,
+                    *self.selected_timeframe.lock().unwrap()
                 ),
                 Style::default().fg(Color::Gray),
             )),
@@ -495,42 +541,45 @@ impl Dashboard {
         f.render_widget(header, area);
     }
 
-    fn render_main_content(&mut self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        if !self.initialized {
-            let loading = Paragraph::new("Loading data... (waiting for enough price history)")
-                .block(Block::default().borders(Borders::ALL));
-            f.render_widget(loading, area);
-            return;
-        }
-
-        match self.current_view {
+    fn render_main_content(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        match *self.current_view.lock().unwrap() {
             DashboardView::Prices => self.render_prices_view(f, area),
             DashboardView::Alerts => self.render_alerts_view(f, area),
             DashboardView::Portfolio => self.render_portfolio_view(f, area),
             DashboardView::Exchanges => self.render_exchanges_view(f, area),
             DashboardView::Indicators => self.render_indicators_view(f, area),
+            DashboardView::Chart => self.render_chart_view(f, area),
         }
     }
 
-    fn render_prices_view(&mut self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        let mut symbols: Vec<&String> = self.prices.keys().collect();
+    fn render_prices_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let prices = self.prices.lock().unwrap();
+        let selected = *self.selected.lock().unwrap();
+        let sort_column = *self.sort_column.lock().unwrap();
+        let sort_ascending = *self.sort_ascending.lock().unwrap();
+
+        let mut symbols: Vec<String> = prices.keys().cloned().collect();
 
         symbols.sort_by(|a, b| {
-            let a_data = self.prices.get(*a).and_then(|p| p.last());
-            let b_data = self.prices.get(*b).and_then(|p| p.last());
+            let a_data = prices.get(a);
+            let b_data = prices.get(b);
 
-            let ordering = match self.sort_column {
+            let ordering = match sort_column {
                 0 => a.cmp(b),
-                1 => a_data.map(|a| a.price)
-                    .partial_cmp(&b_data.map(|b| b.price))
+                1 => a_data
+                    .and_then(|d| d.prices.back())
+                    .map(|p| p.price)
+                    .partial_cmp(&b_data.and_then(|d| d.prices.back()).map(|p| p.price))
                     .unwrap_or(std::cmp::Ordering::Equal),
                 _ => {
-                    if let (Some(a_history), Some(b_history)) = (self.prices.get(*a), self.prices.get(*b)) {
-                        if a_history.len() >= 2 && b_history.len() >= 2 {
-                            let a_change = (a_history.last().unwrap().price - a_history[a_history.len() - 2].price)
-                                / a_history[a_history.len() - 2].price;
-                            let b_change = (b_history.last().unwrap().price - b_history[b_history.len() - 2].price)
-                                / b_history[b_history.len() - 2].price;
+                    if let (Some(a_history), Some(b_history)) = (prices.get(a), prices.get(b)) {
+                        if a_history.prices.len() >= 2 && b_history.prices.len() >= 2 {
+                            let a_change = (a_history.prices.back().unwrap().price
+                                - a_history.prices[a_history.prices.len() - 2].price)
+                                / a_history.prices[a_history.prices.len() - 2].price;
+                            let b_change = (b_history.prices.back().unwrap().price
+                                - b_history.prices[b_history.prices.len() - 2].price)
+                                / b_history.prices[b_history.prices.len() - 2].price;
                             a_change.partial_cmp(&b_change).unwrap_or(std::cmp::Ordering::Equal)
                         } else {
                             std::cmp::Ordering::Equal
@@ -541,17 +590,23 @@ impl Dashboard {
                 }
             };
 
-            if self.sort_ascending { ordering } else { ordering.reverse() }
+            if sort_ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
         });
 
         let rows = symbols.iter().enumerate().map(|(i, symbol)| {
-            let is_selected = i == self.selected;
-            let price_data = self.prices.get(*symbol).and_then(|p| p.last());
-            let price = price_data.map(|p| p.price).unwrap_or(0.0);
-            let change = if let Some(history) = self.prices.get(*symbol) {
-                if history.len() >= 2 {
-                    ((history.last().unwrap().price - history[history.len() - 2].price)
-                        / history[history.len() - 2].price) * 100.0
+            let is_selected = i == selected;
+            let symbol_data = prices.get(symbol);
+            let price = symbol_data.and_then(|d| d.prices.back()).map(|p| p.price).unwrap_or(0.0);
+            let volume = symbol_data.and_then(|d| d.prices.back()).map(|p| p.volume).unwrap_or(0.0);
+            let change = if let Some(data) = symbol_data {
+                if data.prices.len() >= 2 {
+                    ((data.prices.back().unwrap().price - data.prices[data.prices.len() - 2].price)
+                        / data.prices[data.prices.len() - 2].price)
+                        * 100.0
                 } else {
                     0.0
                 }
@@ -559,44 +614,21 @@ impl Dashboard {
                 0.0
             };
 
-            let change_color = if change < 0.0 { Color::Red } else { Color::Green };
+            let change_color = if change < 0.0 {
+                Color::Red
+            } else {
+                Color::Green
+            };
 
-            let sma_value = self.indicators.sma.get(&14).and_then(|v| v.last()).copied().unwrap_or(0.0);
-            let rsi_value = self.indicators.rsi.get(&14).and_then(|v| v.last()).copied().unwrap_or(0.0);
-            let macd_value = self.indicators.macd.get(&(12, 26, 9)).and_then(|m| m.macd_line.last()).copied().unwrap_or(0.0);
-
-            let mut row_cells = vec![
+            Row::new(vec![
                 Cell::from(symbol.as_str()),
                 Cell::from(format_price(&price.to_string())),
                 Cell::from(Span::styled(
                     format_change(&change.to_string()),
                     Style::default().fg(change_color),
                 )),
-            ];
-
-            if self.show_indicators {
-                row_cells.push(Cell::from(format!("SMA14: {:.2}", sma_value)));
-                row_cells.push(Cell::from(Span::styled(
-                    format!("RSI14: {:.1}", rsi_value),
-                    Style::default().fg(if rsi_value > 70.0 {
-                        Color::Red
-                    } else if rsi_value < 30.0 {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    }),
-                )));
-                row_cells.push(Cell::from(Span::styled(
-                    format!("MACD: {:.2}", macd_value),
-                    Style::default().fg(if macd_value > 0.0 {
-                        Color::Green
-                    } else {
-                        Color::Red
-                    }),
-                )));
-            }
-
-            Row::new(row_cells)
+                Cell::from(format_volume(&volume.to_string())),
+            ])
                 .style(if is_selected {
                     Style::default()
                         .fg(Color::Black)
@@ -607,14 +639,9 @@ impl Dashboard {
                 })
         });
 
-        let mut headers = vec!["Pair", "Price", "24h Change"];
-        if self.show_indicators {
-            headers.extend(["SMA(14)", "RSI(14)", "MACD"]);
-        }
-
         let table = Table::new(rows)
             .header(
-                Row::new(headers)
+                Row::new(vec!["Pair", "Price", "24h Change", "Volume"])
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
             .block(Block::default().borders(Borders::ALL).title("Live Prices"))
@@ -622,15 +649,20 @@ impl Dashboard {
                 Constraint::Length(10),
                 Constraint::Length(15),
                 Constraint::Length(12),
+                Constraint::Length(15),
             ]);
 
         f.render_widget(table, area);
     }
 
     fn render_alerts_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        let rows = self.alerts.iter().map(|alert| {
-            let price = self.prices.get(&alert.symbol)
-                .and_then(|p| p.last())
+        let alerts = self.alerts.lock().unwrap();
+        let prices = self.prices.lock().unwrap();
+
+        let rows = alerts.iter().map(|alert| {
+            let price = prices
+                .get(&alert.symbol)
+                .and_then(|d| d.prices.back())
                 .map(|p| p.price)
                 .unwrap_or(0.0);
 
@@ -639,8 +671,7 @@ impl Dashboard {
                 AlertCondition::PriceBelow(t) => ("<", t),
                 AlertCondition::ChangeAbove(t) => ("Δ>", t),
                 AlertCondition::ChangeBelow(t) => ("Δ<", t),
-                AlertCondition::IndicatorCross { indicator, value, direction: _ } =>
-                    (indicator.as_str(), value),
+                AlertCondition::IndicatorCross(ind, t) => (ind.as_str(), t),
             };
 
             let status = if alert.triggered {
@@ -673,10 +704,13 @@ impl Dashboard {
         f.render_widget(table, area);
     }
 
-    fn render_portfolio_view(&mut self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        let total_value = self.portfolio.current_value(&self.prices);
-        let profit_loss = self.portfolio.profit_loss(&self.prices);
-        let pct_change = (profit_loss / self.portfolio.initial_value) * 100.0;
+    fn render_portfolio_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let portfolio = self.portfolio.lock().unwrap();
+        let prices = self.prices.lock().unwrap();
+
+        let total_value = portfolio.current_value(&prices);
+        let profit_loss = portfolio.profit_loss(&prices);
+        let pct_change = (profit_loss / portfolio.initial_value) * 100.0;
 
         let summary = Paragraph::new(Text::from(vec![
             Line::from(vec![
@@ -690,22 +724,27 @@ impl Dashboard {
                 Span::raw("Profit/Loss: "),
                 Span::styled(
                     format!("${:.2} ({:.2}%)", profit_loss, pct_change),
-                    Style::default().fg(if profit_loss >= 0.0 { Color::Green } else { Color::Red }),
+                    Style::default().fg(if profit_loss >= 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
                 ),
             ]),
             Line::from(vec![
                 Span::raw("Available Cash: "),
                 Span::styled(
-                    format!("${:.2}", self.portfolio.cash),
+                    format!("${:.2}", portfolio.cash),
                     Style::default().fg(Color::LightBlue),
                 ),
             ]),
         ]))
             .block(Block::default().borders(Borders::ALL).title("Summary"));
 
-        let rows = self.portfolio.holdings.iter().map(|(symbol, qty)| {
-            let current_price = self.prices.get(symbol)
-                .and_then(|p| p.last())
+        let rows = portfolio.holdings.iter().map(|(symbol, qty)| {
+            let current_price = prices
+                .get(symbol)
+                .and_then(|d| d.prices.back())
                 .map(|p| p.price)
                 .unwrap_or(0.0);
             let value = qty * current_price;
@@ -752,72 +791,155 @@ impl Dashboard {
     }
 
     fn render_indicators_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        let selected_period = self.indicator_periods[self.selected_indicator];
+        let prices = self.prices.lock().unwrap();
+        let selected = *self.selected.lock().unwrap();
 
-        let empty_vec = Vec::new();
-        let empty_macd = MacdData {
-            macd_line: Vec::new(),
-            signal_line: Vec::new(),
-            histogram: Vec::new(),
-        };
+        if let Some(symbol) = prices.keys().nth(selected) {
+            if let Some(data) = prices.get(symbol) {
+                let indicators = &data.indicators;
+                let current_price = data.prices.back().map(|p| p.price).unwrap_or(0.0);
 
-        let sma_values = self.indicators.sma.get(&selected_period).unwrap_or(&empty_vec);
-        let rsi_values = self.indicators.rsi.get(&selected_period).unwrap_or(&empty_vec);
-        let macd_values = self.indicators.macd.get(&(12, 26, 9)).unwrap_or(&empty_macd);
+                let rows = vec![
+                    Row::new(vec![
+                        Cell::from("SMA (20)"),
+                        Cell::from(format_price(
+                            &indicators.sma_20.unwrap_or(0.0).to_string(),
+                        )),
+                        Cell::from(if indicators.sma_20.map_or(false, |sma| current_price > sma) {
+                            "Price > SMA".to_string()
+                        } else {
+                            "Price ≤ SMA".to_string()
+                        }),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("EMA (20)"),
+                        Cell::from(format_price(
+                            &indicators.ema_20.unwrap_or(0.0).to_string(),
+                        )),
+                        Cell::from(if indicators.ema_20.map_or(false, |ema| current_price > ema) {
+                            "Price > EMA".to_string()
+                        } else {
+                            "Price ≤ EMA".to_string()
+                        }),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("RSI (14)"),
+                        Cell::from(format!(
+                            "{:.2}",
+                            indicators.rsi_14.unwrap_or(0.0)
+                        )),
+                        Cell::from(
+                            if indicators.rsi_14.map_or(false, |rsi| rsi > 70.0) {
+                                "Overbought (>70)".to_string()
+                            } else if indicators.rsi_14.map_or(false, |rsi| rsi < 30.0) {
+                                "Oversold (<30)".to_string()
+                            } else {
+                                "Neutral".to_string()
+                            },
+                        ),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("MACD"),
+                        Cell::from(format!(
+                            "{:.4} / {:.4}",
+                            indicators.macd.unwrap_or(0.0),
+                            indicators.macd_signal.unwrap_or(0.0)
+                        )),
+                        Cell::from(
+                            if indicators
+                                .macd
+                                .zip(indicators.macd_signal)
+                                .map_or(false, |(macd, signal)| macd > signal)
+                            {
+                                "Bullish (MACD > Signal)".to_string()
+                            } else {
+                                "Bearish (MACD ≤ Signal)".to_string()
+                            },
+                        ),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("Bollinger Bands"),
+                        Cell::from(format!(
+                            "U: {:.2} / L: {:.2}",
+                            indicators.bollinger_upper.unwrap_or(0.0),
+                            indicators.bollinger_lower.unwrap_or(0.0)
+                        )),
+                        Cell::from(
+                            if indicators.bollinger_upper.map_or(false, |upper| {
+                                current_price > upper
+                            }) {
+                                "Above Upper Band".to_string()
+                            } else if indicators.bollinger_lower.map_or(false, |lower| {
+                                current_price < lower
+                            }) {
+                                "Below Lower Band".to_string()
+                            } else {
+                                "Within Bands".to_string()
+                            },
+                        ),
+                    ]),
+                ];
 
-        let indicator_info = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                format!("Technical Indicators (Period: {})", selected_period),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("SMA: "),
-                Span::styled(
-                    format!("{:.2}", sma_values.last().unwrap_or(&0.0)),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("RSI: "),
-                Span::styled(
-                    format!("{:.1}", rsi_values.last().unwrap_or(&0.0)),
-                    Style::default().fg(if *rsi_values.last().unwrap_or(&0.0) > 70.0 {
-                        Color::Red
-                    } else if *rsi_values.last().unwrap_or(&0.0) < 30.0 {
-                        Color::Green
-                    } else {
-                        Color::Magenta
-                    }),
-                ),
-                Span::raw(" (Overbought >70, Oversold <30)"),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("MACD: "),
-                Span::styled(
-                    format!("{:.2}", macd_values.macd_line.last().unwrap_or(&0.0)),
-                    Style::default().fg(if *macd_values.macd_line.last().unwrap_or(&0.0) > 0.0 {
-                        Color::Green
-                    } else {
-                        Color::Red
-                    }),
-                ),
-                Span::raw(" Signal: "),
-                Span::styled(
-                    format!("{:.2}", macd_values.signal_line.last().unwrap_or(&0.0)),
-                    Style::default().fg(Color::Blue),
-                ),
-            ]),
-        ]))
-            .block(Block::default().borders(Borders::ALL).title("Indicator Details"));
+                let table = Table::new(rows)
+                    .header(
+                        Row::new(vec!["Indicator", "Value", "Signal"])
+                            .style(Style::default().add_modifier(Modifier::BOLD)),
+                    )
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!("Indicators for {}", symbol)),
+                    )
+                    .widths(&[
+                        Constraint::Length(15),
+                        Constraint::Length(20),
+                        Constraint::Length(25),
+                    ]);
 
-        f.render_widget(indicator_info, area);
+                f.render_widget(table, area);
+                return;
+            }
+        }
+
+        let message = Paragraph::new("No symbol selected or no data available")
+            .block(Block::default().borders(Borders::ALL).title("Indicators"));
+        f.render_widget(message, area);
+    }
+
+    fn render_chart_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let prices = self.prices.lock().unwrap();
+        let selected = *self.selected.lock().unwrap();
+
+        if let Some(symbol) = prices.keys().nth(selected) {
+            if let Some(data) = prices.get(symbol) {
+                if data.prices.len() >= 2 {
+                    let chart = Paragraph::new(Text::from(vec![
+                        Line::from(format!("Price Chart for {}", symbol)),
+                        Line::from(""),
+                        Line::from("Coming soon! This will show a proper price chart."),
+                        Line::from(""),
+                        Line::from(format!(
+                            "Current Price: {}",
+                            format_price(&data.prices.back().unwrap().price.to_string())
+                        )),
+                    ]))
+                        .block(Block::default().borders(Borders::ALL).title("Chart"));
+
+                    f.render_widget(chart, area);
+                    return;
+                }
+            }
+        }
+
+        let message = Paragraph::new("No symbol selected or insufficient data for chart")
+            .block(Block::default().borders(Borders::ALL).title("Chart"));
+        f.render_widget(message, area);
     }
 
     fn render_footer(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        let controls = match self.current_view {
+        let current_view = *self.current_view.lock().unwrap();
+
+        let controls = match current_view {
             DashboardView::Prices => vec![
                 Span::raw("Controls: "),
                 Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
@@ -832,36 +954,19 @@ impl Dashboard {
                 Span::raw(" Exchanges  "),
                 Span::styled("i", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Indicators  "),
+                Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Chart  "),
+                Span::styled("b", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Buy  "),
+                Span::styled("x", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Sell  "),
                 Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Toggle Indicators  "),
+                Span::raw(" Timeframe  "),
                 Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Quit"),
             ],
-            DashboardView::Alerts => vec![
+            _ => vec![
                 Span::raw("Controls: "),
-                Span::styled("v", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Prices  "),
-                Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Quit"),
-            ],
-            DashboardView::Portfolio => vec![
-                Span::raw("Controls: "),
-                Span::styled("v", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Prices  "),
-                Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Quit"),
-            ],
-            DashboardView::Exchanges => vec![
-                Span::raw("Controls: "),
-                Span::styled("v", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Prices  "),
-                Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Quit"),
-            ],
-            DashboardView::Indicators => vec![
-                Span::raw("Controls: "),
-                Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" Change Period  "),
                 Span::styled("v", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Prices  "),
                 Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
@@ -893,6 +998,21 @@ fn format_price(price: &str) -> String {
 fn format_change(change: &str) -> String {
     change.parse::<f64>().map_or_else(
         |_| format!("{:>7}", change),
-        |c| format!("{:>7.2}", c),
+        |c| format!("{:>7.2}%", c),
+    )
+}
+
+fn format_volume(volume: &str) -> String {
+    volume.parse::<f64>().map_or_else(
+        |_| format!("{:>15}", volume),
+        |v| {
+            if v > 1_000_000.0 {
+                format!("{:>10.2}M", v / 1_000_000.0)
+            } else if v > 1_000.0 {
+                format!("{:>10.2}K", v / 1_000.0)
+            } else {
+                format!("{:>10.2}", v)
+            }
+        },
     )
 }
