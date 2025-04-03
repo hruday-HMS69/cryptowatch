@@ -34,6 +34,7 @@ pub enum DashboardView {
     Exchanges,
     Indicators,
     Chart,
+    Candles,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,16 @@ pub enum Exchange {
 }
 
 #[derive(Debug, Clone)]
+pub struct CandleData {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct PriceData {
     pub price: f64,
     pub volume: f64,
@@ -82,13 +93,15 @@ pub struct IndicatorData {
 #[derive(Debug, Clone)]
 pub struct SymbolData {
     pub prices: VecDeque<PriceData>,
+    pub candles: VecDeque<CandleData>,
     pub indicators: IndicatorData,
 }
 
 impl SymbolData {
     pub fn new() -> Self {
         Self {
-            prices: VecDeque::new(),
+            prices: VecDeque::with_capacity(100),
+            candles: VecDeque::with_capacity(50),
             indicators: IndicatorData {
                 sma_20: None,
                 ema_20: None,
@@ -134,6 +147,97 @@ impl SymbolData {
         if let Some(bb_output) = bb_output {
             self.indicators.bollinger_upper = Some(bb_output.upper);
             self.indicators.bollinger_lower = Some(bb_output.lower);
+        }
+    }
+
+    pub fn update_candles(&mut self, timeframe: Timeframe) {
+        if self.prices.is_empty() {
+            return;
+        }
+
+        let now = Local::now().timestamp();
+        let timeframe_secs = timeframe.as_secs();
+
+        let mut current_candle_start = (now / timeframe_secs) * timeframe_secs;
+        let mut current_candle = CandleData {
+            open: self.prices[0].price,
+            high: self.prices[0].price,
+            low: self.prices[0].price,
+            close: self.prices[0].price,
+            volume: self.prices[0].volume,
+            timestamp: current_candle_start,
+        };
+
+        for price in &self.prices {
+            let price_time = price.timestamp;
+            let candle_start = (price_time / timeframe_secs) * timeframe_secs;
+
+            if candle_start != current_candle_start {
+                self.candles.push_back(current_candle);
+                if self.candles.len() > 50 {
+                    self.candles.pop_front();
+                }
+
+                current_candle_start = candle_start;
+                current_candle = CandleData {
+                    open: price.price,
+                    high: price.price,
+                    low: price.price,
+                    close: price.price,
+                    volume: price.volume,
+                    timestamp: current_candle_start,
+                };
+            } else {
+                current_candle.high = current_candle.high.max(price.price);
+                current_candle.low = current_candle.low.min(price.price);
+                current_candle.close = price.price;
+                current_candle.volume += price.volume;
+            }
+        }
+
+        self.candles.push_back(current_candle);
+        if self.candles.len() > 50 {
+            self.candles.pop_front();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timeframe {
+    M1,
+    M5,
+    M15,
+    M30,
+    H1,
+    H4,
+    D1,
+    W1,
+}
+
+impl Timeframe {
+    pub fn as_secs(&self) -> i64 {
+        match self {
+            Timeframe::M1 => 60,
+            Timeframe::M5 => 300,
+            Timeframe::M15 => 900,
+            Timeframe::M30 => 1800,
+            Timeframe::H1 => 3600,
+            Timeframe::H4 => 14400,
+            Timeframe::D1 => 86400,
+            Timeframe::W1 => 604800,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Timeframe::M1 => "1m",
+            Timeframe::M5 => "5m",
+            Timeframe::M15 => "15m",
+            Timeframe::M30 => "30m",
+            Timeframe::H1 => "1h",
+            Timeframe::H4 => "4h",
+            Timeframe::D1 => "1d",
+            Timeframe::W1 => "1w",
         }
     }
 }
@@ -246,18 +350,7 @@ pub struct Dashboard {
     pub price_history_length: usize,
     pub running: Arc<Mutex<bool>>,
     pub selected_timeframe: Arc<Mutex<Timeframe>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Timeframe {
-    M1,
-    M5,
-    M15,
-    M30,
-    H1,
-    H4,
-    D1,
-    W1,
+    pub ws_connected: Arc<Mutex<bool>>,
 }
 
 impl Dashboard {
@@ -286,7 +379,12 @@ impl Dashboard {
             price_history_length: 100,
             running: Arc::new(Mutex::new(true)),
             selected_timeframe: Arc::new(Mutex::new(Timeframe::M1)),
+            ws_connected: Arc::new(Mutex::new(false)),
         }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        *self.ws_connected.lock().unwrap()
     }
 
     pub async fn run(
@@ -299,6 +397,8 @@ impl Dashboard {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
+
+        *self.ws_connected.lock().unwrap() = true;
 
         while *self.running.lock().unwrap() {
             if event::poll(std::time::Duration::from_millis(100))? {
@@ -330,6 +430,7 @@ impl Dashboard {
             })?;
         }
 
+        *self.ws_connected.lock().unwrap() = false;
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         Ok(())
@@ -343,6 +444,7 @@ impl Dashboard {
             KeyCode::Char('e') => *self.current_view.lock().unwrap() = DashboardView::Exchanges,
             KeyCode::Char('i') => *self.current_view.lock().unwrap() = DashboardView::Indicators,
             KeyCode::Char('c') => *self.current_view.lock().unwrap() = DashboardView::Chart,
+            KeyCode::Char('k') => *self.current_view.lock().unwrap() = DashboardView::Candles,
             KeyCode::Char('v') => *self.current_view.lock().unwrap() = DashboardView::Prices,
             KeyCode::Up => {
                 let mut selected = self.selected.lock().unwrap();
@@ -414,28 +516,26 @@ impl Dashboard {
         price: &str,
         change: &str,
     ) -> Result<(), DynError> {
-        
-        if price.trim().is_empty() {
-            log::warn!("Empty price received for {}", symbol);
-            return Ok(());
-        }
-
-        // Parse price with error handling
-        let price_num = match price.parse::<f64>() {
-            Ok(num) => num,
+        let price = match price.parse::<f64>() {
+            Ok(p) => p,
             Err(e) => {
                 log::error!("Failed to parse price '{}' for {}: {}", price, symbol, e);
-                return Ok(()); // Skip this update but keep running
+                return Ok(());
             }
         };
 
-        
-        let change_num = change.parse::<f64>().unwrap_or(0.0);
+        let change = match change.parse::<f64>() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to parse change '{}' for {}: {}", change, symbol, e);
+                return Ok(());
+            }
+        };
 
         let timestamp = Local::now().timestamp();
 
         let price_data = PriceData {
-            price: price_num,
+            price,
             volume: 0.0,
             timestamp,
             exchange: Exchange::Binance,
@@ -452,6 +552,7 @@ impl Dashboard {
         }
 
         symbol_data.update_indicators();
+        symbol_data.update_candles(*self.selected_timeframe.lock().unwrap());
 
         Ok(())
     }
@@ -518,20 +619,23 @@ impl Dashboard {
         let portfolio = self.portfolio.lock().unwrap();
         let prices = self.prices.lock().unwrap();
 
+        let connection_status = if self.is_connected() {
+            Span::styled("CONNECTED", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("DISCONNECTED", Style::default().fg(Color::Red))
+        };
+
         let header = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                "CRYPTOWATCH DASHBOARD",
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(vec![
+                Span::styled("CRYPTOWATCH ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                connection_status,
+            ]),
             Line::from(Span::styled(
                 format!(
-                    "Last update: {} | Portfolio: ${:.2} | P/L: {:.2}% | Timeframe: {:?}",
+                    "Last update: {} | Portfolio: ${:.2} | Timeframe: {}",
                     Local::now().format("%H:%M:%S"),
                     portfolio.current_value(&prices),
-                    portfolio.profit_loss(&prices) / portfolio.initial_value * 100.0,
-                    *self.selected_timeframe.lock().unwrap()
+                    self.selected_timeframe.lock().unwrap().as_str()
                 ),
                 Style::default().fg(Color::Gray),
             )),
@@ -549,6 +653,7 @@ impl Dashboard {
             DashboardView::Exchanges => self.render_exchanges_view(f, area),
             DashboardView::Indicators => self.render_indicators_view(f, area),
             DashboardView::Chart => self.render_chart_view(f, area),
+            DashboardView::Candles => self.render_candles_view(f, area),
         }
     }
 
@@ -557,6 +662,17 @@ impl Dashboard {
         let selected = *self.selected.lock().unwrap();
         let sort_column = *self.sort_column.lock().unwrap();
         let sort_ascending = *self.sort_ascending.lock().unwrap();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Live Prices");
+
+        let inner_area = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner_area.height < 3 || inner_area.width < 30 {
+            return;
+        }
 
         let mut symbols: Vec<String> = prices.keys().cloned().collect();
 
@@ -644,7 +760,6 @@ impl Dashboard {
                 Row::new(vec!["Pair", "Price", "24h Change", "Volume"])
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
-            .block(Block::default().borders(Borders::ALL).title("Live Prices"))
             .widths(&[
                 Constraint::Length(10),
                 Constraint::Length(15),
@@ -652,12 +767,23 @@ impl Dashboard {
                 Constraint::Length(15),
             ]);
 
-        f.render_widget(table, area);
+        f.render_widget(table, inner_area);
     }
 
     fn render_alerts_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
         let alerts = self.alerts.lock().unwrap();
         let prices = self.prices.lock().unwrap();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Alerts");
+
+        let inner_area = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner_area.height < 3 || inner_area.width < 30 {
+            return;
+        }
 
         let rows = alerts.iter().map(|alert| {
             let price = prices
@@ -693,7 +819,6 @@ impl Dashboard {
                 Row::new(vec!["Symbol", "Condition", "Current", "Status"])
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
-            .block(Block::default().borders(Borders::ALL).title("Alerts"))
             .widths(&[
                 Constraint::Length(10),
                 Constraint::Length(15),
@@ -701,7 +826,7 @@ impl Dashboard {
                 Constraint::Length(12),
             ]);
 
-        f.render_widget(table, area);
+        f.render_widget(table, inner_area);
     }
 
     fn render_portfolio_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
@@ -909,23 +1034,57 @@ impl Dashboard {
     fn render_chart_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
         let prices = self.prices.lock().unwrap();
         let selected = *self.selected.lock().unwrap();
+        let timeframe = *self.selected_timeframe.lock().unwrap();
 
         if let Some(symbol) = prices.keys().nth(selected) {
             if let Some(data) = prices.get(symbol) {
                 if data.prices.len() >= 2 {
-                    let chart = Paragraph::new(Text::from(vec![
-                        Line::from(format!("Price Chart for {}", symbol)),
-                        Line::from(""),
-                        Line::from("Coming soon! This will show a proper price chart."),
-                        Line::from(""),
-                        Line::from(format!(
-                            "Current Price: {}",
-                            format_price(&data.prices.back().unwrap().price.to_string())
-                        )),
-                    ]))
-                        .block(Block::default().borders(Borders::ALL).title("Chart"));
+                    let chart_area = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(3), Constraint::Min(5)])
+                        .split(area);
 
-                    f.render_widget(chart, area);
+                    let current_price = data.prices.back().unwrap().price;
+                    let price_change = if data.prices.len() >= 2 {
+                        let prev_price = data.prices[data.prices.len() - 2].price;
+                        (current_price - prev_price) / prev_price * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let change_color = if price_change < 0.0 {
+                        Color::Red
+                    } else {
+                        Color::Green
+                    };
+
+                    let header = Paragraph::new(Text::from(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{} Price Chart ({})", symbol, timeframe.as_str()),
+                                Style::default()
+                                    .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::raw("Current: "),
+                            Span::styled(
+                                format_price(&current_price.to_string()),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::raw(" ("),
+                            Span::styled(
+                                format_change(&price_change.to_string()),
+                                Style::default().fg(change_color),
+                            ),
+                            Span::raw(")"),
+                        ]),
+                    ]))
+                        .block(Block::default().borders(Borders::NONE));
+
+                    f.render_widget(header, chart_area[0]);
+                    self.render_line_chart(f, chart_area[1], symbol, data);
                     return;
                 }
             }
@@ -934,6 +1093,271 @@ impl Dashboard {
         let message = Paragraph::new("No symbol selected or insufficient data for chart")
             .block(Block::default().borders(Borders::ALL).title("Chart"));
         f.render_widget(message, area);
+    }
+
+    fn render_line_chart(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        symbol: &str,
+        data: &SymbolData,
+    ) {
+        if data.prices.len() < 2 {
+            let message = Paragraph::new("Insufficient data for chart")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let min_price = data.prices.iter().map(|p| p.price).fold(f64::INFINITY, f64::min);
+        let max_price = data.prices.iter().map(|p| p.price).fold(0.0, f64::max);
+        let price_range = max_price - min_price;
+
+        if price_range <= 0.0 {
+            let message = Paragraph::new("No price variation to display")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("{} Price History", symbol));
+
+
+        let inner_area = chart_block.inner(area);
+        if inner_area.height < 3 || inner_area.width < 10 {
+            return;
+        }
+        f.render_widget(chart_block, area);
+
+        let height = inner_area.height as f64;
+        let width = inner_area.width as f64;
+        let step = (data.prices.len() as f64 / width).ceil() as usize;
+        let points: Vec<(f64, f64)> = data.prices
+            .iter()
+            .enumerate()
+            .step_by(step)
+            .map(|(i, p)| {
+                let x = (i as f64 / step as f64).min(width - 1.0);
+                let y = height - 1.0 - ((p.price - min_price) / price_range * (height - 2.0));
+                (x, y)
+            })
+            .collect();
+
+        for window in points.windows(2) {
+            if let [(x1, y1), (x2, y2)] = window {
+                let start_x = inner_area.x + x1.round() as u16;
+                let start_y = inner_area.y + y1.round() as u16;
+                let end_x = inner_area.x + x2.round() as u16;
+                let end_y = inner_area.y + y2.round() as u16;
+
+                if start_x == end_x && start_y == end_y {
+                    let dot = Paragraph::new("◉")
+                        .style(Style::default().fg(Color::LightBlue));
+                    f.render_widget(dot, Rect::new(start_x, start_y, 1, 1));
+                } else {
+                    let mut x = start_x;
+                    let mut y = start_y;
+                    let dx = end_x as i16 - start_x as i16;
+                    let dy = end_y as i16 - start_y as i16;
+                    let step = dx.abs().max(dy.abs());
+
+                    for _ in 0..=step {
+                        let dot = Paragraph::new("▪")
+                            .style(Style::default().fg(Color::LightBlue));
+                        f.render_widget(dot, Rect::new(x, y, 1, 1));
+                        x = (x as i16 + dx / step) as u16;
+                        y = (y as i16 + dy / step) as u16;
+                    }
+                }
+            }
+        }
+
+        let top_label = Paragraph::new(format!("{:.2}", max_price))
+            .style(Style::default().fg(Color::Gray));
+        let bottom_label = Paragraph::new(format!("{:.2}", min_price))
+            .style(Style::default().fg(Color::Gray));
+
+        f.render_widget(
+            top_label,
+            Rect::new(inner_area.right() - 8, inner_area.y, 8, 1),
+        );
+        f.render_widget(
+            bottom_label,
+            Rect::new(inner_area.right() - 8, inner_area.bottom() - 1, 8, 1),
+        );
+    }
+
+    fn render_candles_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let mut prices = self.prices.lock().unwrap();
+        let selected = *self.selected.lock().unwrap();
+        let timeframe = *self.selected_timeframe.lock().unwrap();
+
+        let symbol = prices.keys().nth(selected).map(|s| s.clone());
+
+        if let Some(symbol) = symbol {
+            if let Some(data) = prices.get_mut(&symbol) {
+                data.update_candles(timeframe);
+
+                if !data.candles.is_empty() {
+                    let chart_area = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(3), Constraint::Min(5)])
+                        .split(area);
+
+                    let current_candle = data.candles.back().unwrap();
+                    let header = Paragraph::new(Text::from(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{} Candles ({})", symbol, timeframe.as_str()),
+                                Style::default()
+                                    .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::raw("O: "),
+                            Span::styled(
+                                format_price(&current_candle.open.to_string()),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::raw(" H: "),
+                            Span::styled(
+                                format_price(&current_candle.high.to_string()),
+                                Style::default().fg(Color::Green),
+                            ),
+                            Span::raw(" L: "),
+                            Span::styled(
+                                format_price(&current_candle.low.to_string()),
+                                Style::default().fg(Color::Red),
+                            ),
+                            Span::raw(" C: "),
+                            Span::styled(
+                                format_price(&current_candle.close.to_string()),
+                                Style::default().fg(
+                                    if current_candle.close >= current_candle.open {
+                                        Color::Green
+                                    } else {
+                                        Color::Red
+                                    },
+                                ),
+                            ),
+                        ]),
+                    ]))
+                        .block(Block::default().borders(Borders::NONE));
+
+                    f.render_widget(header, chart_area[0]);
+                    self.render_candle_chart(f, chart_area[1], &symbol, data);
+                    return;
+                }
+            }
+        }
+
+        let message = Paragraph::new("No symbol selected or insufficient data for candles")
+            .block(Block::default().borders(Borders::ALL).title("Candles"));
+        f.render_widget(message, area);
+    }
+
+    fn render_candle_chart(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        symbol: &str,
+        data: &SymbolData,
+    ) {
+        if data.candles.len() < 2 {
+            let message = Paragraph::new("Insufficient data for candles")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let min_price = data.candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+        let max_price = data.candles.iter().map(|c| c.high).fold(0.0, f64::max);
+        let price_range = max_price - min_price;
+
+        if price_range <= 0.0 {
+            let message = Paragraph::new("No price variation to display")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("{} Candles", symbol));
+
+
+        let inner_area = chart_block.inner(area);
+        if inner_area.height < 3 || inner_area.width < 10 {
+            return;
+        }
+        f.render_widget(chart_block, area);
+
+        let candle_width = (inner_area.width as f32 / data.candles.len() as f32).max(1.0) as u16;
+        let candle_spacing = 1;
+
+        for (i, candle) in data.candles.iter().enumerate() {
+            let x = inner_area.x + (i as u16 * (candle_width + candle_spacing));
+            if x >= inner_area.right() {
+                break;
+            }
+
+            let open_y = inner_area.y + (inner_area.height - 1) -
+                (((candle.open - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
+            let close_y = inner_area.y + (inner_area.height - 1) -
+                (((candle.close - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
+            let high_y = inner_area.y + (inner_area.height - 1) -
+                (((candle.high - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
+            let low_y = inner_area.y + (inner_area.height - 1) -
+                (((candle.low - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
+
+            let is_bullish = candle.close >= candle.open;
+            let color = if is_bullish { Color::Green } else { Color::Red };
+
+            // Draw wick (high to low)
+            for y in low_y..=high_y {
+                let wick = Paragraph::new("│")
+                    .style(Style::default().fg(color));
+                f.render_widget(
+                    wick,
+                    Rect::new(x + candle_width / 2, y, 1, 1),
+                );
+            }
+
+            // Draw body
+            let (top, bottom) = if is_bullish {
+                (close_y, open_y)
+            } else {
+                (open_y, close_y)
+            };
+
+            for y in bottom..=top {
+                for w in 0..candle_width {
+                    let body = Paragraph::new("█")
+                        .style(Style::default().fg(color));
+                    f.render_widget(
+                        body,
+                        Rect::new(x + w, y, 1, 1),
+                    );
+                }
+            }
+        }
+
+        let top_label = Paragraph::new(format!("{:.2}", max_price))
+            .style(Style::default().fg(Color::Gray));
+        let bottom_label = Paragraph::new(format!("{:.2}", min_price))
+            .style(Style::default().fg(Color::Gray));
+
+        f.render_widget(
+            top_label,
+            Rect::new(inner_area.right() - 8, inner_area.y, 8, 1),
+        );
+        f.render_widget(
+            bottom_label,
+            Rect::new(inner_area.right() - 8, inner_area.bottom() - 1, 8, 1),
+        );
     }
 
     fn render_footer(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
@@ -956,12 +1380,23 @@ impl Dashboard {
                 Span::raw(" Indicators  "),
                 Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Chart  "),
+                Span::styled("k", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Candles  "),
                 Span::styled("b", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Buy  "),
                 Span::styled("x", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Sell  "),
                 Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Timeframe  "),
+                Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Quit"),
+            ],
+            DashboardView::Chart | DashboardView::Candles => vec![
+                Span::raw("Controls: "),
+                Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Timeframe  "),
+                Span::styled("v", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Prices  "),
                 Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Quit"),
             ],
