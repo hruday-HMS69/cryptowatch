@@ -1,15 +1,17 @@
+use crate::api::binance::ws::LatencyData;
 use chrono::Local;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::layout::Alignment;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table},
     Frame, Terminal,
 };
 use std::collections::{HashMap, VecDeque};
@@ -35,6 +37,12 @@ pub enum DashboardView {
     Indicators,
     Chart,
     Candles,
+    Latency,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatencyDisplayMode {
+    LineChart,
+    Sparkline,
 }
 
 #[derive(Debug, Clone)]
@@ -276,17 +284,14 @@ impl Portfolio {
     }
 
     pub fn current_value(&self, prices: &HashMap<String, SymbolData>) -> f64 {
-        self.holdings
-            .iter()
-            .fold(0.0, |acc, (symbol, qty)| {
-                prices
-                    .get(symbol)
-                    .and_then(|data| data.prices.back())
-                    .map(|price_data| price_data.price * qty)
-                    .unwrap_or(0.0)
-                    + acc
-            })
-            + self.cash
+        self.holdings.iter().fold(0.0, |acc, (symbol, qty)| {
+            prices
+                .get(symbol)
+                .and_then(|data| data.prices.back())
+                .map(|price_data| price_data.price * qty)
+                .unwrap_or(0.0)
+                + acc
+        }) + self.cash
     }
 
     pub fn profit_loss(&self, prices: &HashMap<String, SymbolData>) -> f64 {
@@ -351,6 +356,10 @@ pub struct Dashboard {
     pub running: Arc<Mutex<bool>>,
     pub selected_timeframe: Arc<Mutex<Timeframe>>,
     pub ws_connected: Arc<Mutex<bool>>,
+    pub latency_data: Arc<Mutex<HashMap<String, VecDeque<LatencyData>>>>,
+    pub latency_display_mode: Arc<Mutex<LatencyDisplayMode>>,
+    pub show_latency_thresholds: Arc<Mutex<bool>>,
+    pub latency_zoom: Arc<Mutex<u8>>, // 0=normal, 1=zoomed, 2=max zoom
 }
 
 impl Dashboard {
@@ -380,6 +389,10 @@ impl Dashboard {
             running: Arc::new(Mutex::new(true)),
             selected_timeframe: Arc::new(Mutex::new(Timeframe::M1)),
             ws_connected: Arc::new(Mutex::new(false)),
+            latency_data: Arc::new(Mutex::new(HashMap::new())),
+            latency_display_mode: Arc::new(Mutex::new(LatencyDisplayMode::LineChart)),
+            show_latency_thresholds: Arc::new(Mutex::new(true)),
+            latency_zoom: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -446,6 +459,49 @@ impl Dashboard {
             KeyCode::Char('c') => *self.current_view.lock().unwrap() = DashboardView::Chart,
             KeyCode::Char('k') => *self.current_view.lock().unwrap() = DashboardView::Candles,
             KeyCode::Char('v') => *self.current_view.lock().unwrap() = DashboardView::Prices,
+            KeyCode::Char('l') => *self.current_view.lock().unwrap() = DashboardView::Latency,
+            KeyCode::Left => {
+                let mut selected = self.selected.lock().unwrap();
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let mut selected = self.selected.lock().unwrap();
+                *selected = selected.saturating_add(1);
+            }
+            KeyCode::Char('t') => {
+                let current_view = *self.current_view.lock().unwrap();
+                if current_view == DashboardView::Latency {
+                    // Toggle display mode in latency view
+                    let mut display_mode = self.latency_display_mode.lock().unwrap();
+                    *display_mode = match *display_mode {
+                        LatencyDisplayMode::LineChart => LatencyDisplayMode::Sparkline,
+                        LatencyDisplayMode::Sparkline => LatencyDisplayMode::LineChart,
+                    };
+                } else {
+                    // Switch timeframe in other views
+                    let mut timeframe = self.selected_timeframe.lock().unwrap();
+                    *timeframe = match *timeframe {
+                        Timeframe::M1 => Timeframe::M5,
+                        Timeframe::M5 => Timeframe::M15,
+                        Timeframe::M15 => Timeframe::M30,
+                        Timeframe::M30 => Timeframe::H1,
+                        Timeframe::H1 => Timeframe::H4,
+                        Timeframe::H4 => Timeframe::D1,
+                        Timeframe::D1 => Timeframe::W1,
+                        Timeframe::W1 => Timeframe::M1,
+                    };
+                }
+        }
+            KeyCode::Char('h') => {
+                // Show/hide threshold lines
+                let mut show_thresholds = self.show_latency_thresholds.lock().unwrap();
+                *show_thresholds = !*show_thresholds;
+            }
+            KeyCode::Char('z') => {
+                // Zoom in/out
+                let mut zoom = self.latency_zoom.lock().unwrap();
+                *zoom = (*zoom + 1) % 3; // Cycles through 0,1,2 zoom levels
+            }
             KeyCode::Up => {
                 let mut selected = self.selected.lock().unwrap();
                 *selected = selected.saturating_sub(1);
@@ -460,19 +516,8 @@ impl Dashboard {
                 let mut sort_ascending = self.sort_ascending.lock().unwrap();
                 *sort_ascending = !*sort_ascending;
             }
-            KeyCode::Char('t') => {
-                let mut timeframe = self.selected_timeframe.lock().unwrap();
-                *timeframe = match *timeframe {
-                    Timeframe::M1 => Timeframe::M5,
-                    Timeframe::M5 => Timeframe::M15,
-                    Timeframe::M15 => Timeframe::M30,
-                    Timeframe::M30 => Timeframe::H1,
-                    Timeframe::H1 => Timeframe::H4,
-                    Timeframe::H4 => Timeframe::D1,
-                    Timeframe::D1 => Timeframe::W1,
-                    Timeframe::W1 => Timeframe::M1,
-                };
-            }
+
+
             KeyCode::Char('b') => {
                 let prices = self.prices.lock().unwrap();
                 let selected = *self.selected.lock().unwrap();
@@ -505,17 +550,12 @@ impl Dashboard {
                     }
                 }
             }
-            _ => {}
+            _ => (),
         }
         Ok(())
     }
 
-    async fn update_price(
-        &self,
-        symbol: &str,
-        price: &str,
-        change: &str,
-    ) -> Result<(), DynError> {
+    async fn update_price(&self, symbol: &str, price: &str, change: &str) -> Result<(), DynError> {
         let price = match price.parse::<f64>() {
             Ok(p) => p,
             Err(e) => {
@@ -524,7 +564,7 @@ impl Dashboard {
             }
         };
 
-        let change = match change.parse::<f64>() {
+        let _change = match change.parse::<f64>() {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Failed to parse change '{}' for {}: {}", change, symbol, e);
@@ -596,19 +636,23 @@ impl Dashboard {
                         false
                     }
                 }
-                AlertCondition::IndicatorCross(indicator, threshold) => {
-                    match indicator.as_str() {
-                        "RSI" => symbol_data.indicators.rsi_14.map_or(false, |rsi| rsi > *threshold),
-                        "MACD" => symbol_data
-                            .indicators
-                            .macd
-                            .zip(symbol_data.indicators.macd_signal)
-                            .map_or(false, |(macd, signal)| macd > signal),
-                        "BB" => price_data.price > symbol_data.indicators.bollinger_upper.unwrap_or(0.0)
-                            || price_data.price < symbol_data.indicators.bollinger_lower.unwrap_or(0.0),
-                        _ => false,
+                AlertCondition::IndicatorCross(indicator, threshold) => match indicator.as_str() {
+                    "RSI" => symbol_data
+                        .indicators
+                        .rsi_14
+                        .map_or(false, |rsi| rsi > *threshold),
+                    "MACD" => symbol_data
+                        .indicators
+                        .macd
+                        .zip(symbol_data.indicators.macd_signal)
+                        .map_or(false, |(macd, signal)| macd > signal),
+                    "BB" => {
+                        price_data.price > symbol_data.indicators.bollinger_upper.unwrap_or(0.0)
+                            || price_data.price
+                            < symbol_data.indicators.bollinger_lower.unwrap_or(0.0)
                     }
-                }
+                    _ => false,
+                },
             };
             alert.triggered = should_trigger;
         }
@@ -627,7 +671,12 @@ impl Dashboard {
 
         let header = Paragraph::new(Text::from(vec![
             Line::from(vec![
-                Span::styled("CRYPTOWATCH ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "CRYPTOWATCH ",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 connection_status,
             ]),
             Line::from(Span::styled(
@@ -645,27 +694,13 @@ impl Dashboard {
         f.render_widget(header, area);
     }
 
-    fn render_main_content(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
-        match *self.current_view.lock().unwrap() {
-            DashboardView::Prices => self.render_prices_view(f, area),
-            DashboardView::Alerts => self.render_alerts_view(f, area),
-            DashboardView::Portfolio => self.render_portfolio_view(f, area),
-            DashboardView::Exchanges => self.render_exchanges_view(f, area),
-            DashboardView::Indicators => self.render_indicators_view(f, area),
-            DashboardView::Chart => self.render_chart_view(f, area),
-            DashboardView::Candles => self.render_candles_view(f, area),
-        }
-    }
-
     fn render_prices_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
         let prices = self.prices.lock().unwrap();
         let selected = *self.selected.lock().unwrap();
         let sort_column = *self.sort_column.lock().unwrap();
         let sort_ascending = *self.sort_ascending.lock().unwrap();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title("Live Prices");
+        let block = Block::default().borders(Borders::ALL).title("Live Prices");
 
         let inner_area = block.inner(area);
         f.render_widget(block, area);
@@ -696,7 +731,9 @@ impl Dashboard {
                             let b_change = (b_history.prices.back().unwrap().price
                                 - b_history.prices[b_history.prices.len() - 2].price)
                                 / b_history.prices[b_history.prices.len() - 2].price;
-                            a_change.partial_cmp(&b_change).unwrap_or(std::cmp::Ordering::Equal)
+                            a_change
+                                .partial_cmp(&b_change)
+                                .unwrap_or(std::cmp::Ordering::Equal)
                         } else {
                             std::cmp::Ordering::Equal
                         }
@@ -716,8 +753,14 @@ impl Dashboard {
         let rows = symbols.iter().enumerate().map(|(i, symbol)| {
             let is_selected = i == selected;
             let symbol_data = prices.get(symbol);
-            let price = symbol_data.and_then(|d| d.prices.back()).map(|p| p.price).unwrap_or(0.0);
-            let volume = symbol_data.and_then(|d| d.prices.back()).map(|p| p.volume).unwrap_or(0.0);
+            let price = symbol_data
+                .and_then(|d| d.prices.back())
+                .map(|p| p.price)
+                .unwrap_or(0.0);
+            let volume = symbol_data
+                .and_then(|d| d.prices.back())
+                .map(|p| p.volume)
+                .unwrap_or(0.0);
             let change = if let Some(data) = symbol_data {
                 if data.prices.len() >= 2 {
                     ((data.prices.back().unwrap().price - data.prices[data.prices.len() - 2].price)
@@ -738,12 +781,12 @@ impl Dashboard {
 
             Row::new(vec![
                 Cell::from(symbol.as_str()),
-                Cell::from(format_price(&price.to_string())),
+                Cell::from(Self::format_price(&price.to_string())),
                 Cell::from(Span::styled(
-                    format_change(&change.to_string()),
+                    Self::format_change(&change.to_string()),
                     Style::default().fg(change_color),
                 )),
-                Cell::from(format_volume(&volume.to_string())),
+                Cell::from(Self::format_volume(&volume.to_string())),
             ])
                 .style(if is_selected {
                     Style::default()
@@ -774,9 +817,7 @@ impl Dashboard {
         let alerts = self.alerts.lock().unwrap();
         let prices = self.prices.lock().unwrap();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title("Alerts");
+        let block = Block::default().borders(Borders::ALL).title("Alerts");
 
         let inner_area = block.inner(area);
         f.render_widget(block, area);
@@ -809,7 +850,7 @@ impl Dashboard {
             Row::new(vec![
                 Cell::from(alert.symbol.as_str()),
                 Cell::from(format!("{} {:.2}", condition_text, threshold)),
-                Cell::from(format_price(&price.to_string())),
+                Cell::from(Self::format_price(&price.to_string())),
                 Cell::from(status),
             ])
         });
@@ -877,7 +918,7 @@ impl Dashboard {
             Row::new(vec![
                 Cell::from(symbol.as_str()),
                 Cell::from(format!("{:.4}", qty)),
-                Cell::from(format_price(&current_price.to_string())),
+                Cell::from(Self::format_price(&current_price.to_string())),
                 Cell::from(format!("${:.2}", value)),
             ])
         });
@@ -927,41 +968,40 @@ impl Dashboard {
                 let rows = vec![
                     Row::new(vec![
                         Cell::from("SMA (20)"),
-                        Cell::from(format_price(
+                        Cell::from(Self::format_price(
                             &indicators.sma_20.unwrap_or(0.0).to_string(),
                         )),
-                        Cell::from(if indicators.sma_20.map_or(false, |sma| current_price > sma) {
-                            "Price > SMA".to_string()
-                        } else {
-                            "Price ≤ SMA".to_string()
-                        }),
+                        Cell::from(
+                            if indicators.sma_20.map_or(false, |sma| current_price > sma) {
+                                "Price > SMA".to_string()
+                            } else {
+                                "Price ≤ SMA".to_string()
+                            },
+                        ),
                     ]),
                     Row::new(vec![
                         Cell::from("EMA (20)"),
-                        Cell::from(format_price(
+                        Cell::from(Self::format_price(
                             &indicators.ema_20.unwrap_or(0.0).to_string(),
                         )),
-                        Cell::from(if indicators.ema_20.map_or(false, |ema| current_price > ema) {
-                            "Price > EMA".to_string()
-                        } else {
-                            "Price ≤ EMA".to_string()
-                        }),
+                        Cell::from(
+                            if indicators.ema_20.map_or(false, |ema| current_price > ema) {
+                                "Price > EMA".to_string()
+                            } else {
+                                "Price ≤ EMA".to_string()
+                            },
+                        ),
                     ]),
                     Row::new(vec![
                         Cell::from("RSI (14)"),
-                        Cell::from(format!(
-                            "{:.2}",
-                            indicators.rsi_14.unwrap_or(0.0)
-                        )),
-                        Cell::from(
-                            if indicators.rsi_14.map_or(false, |rsi| rsi > 70.0) {
-                                "Overbought (>70)".to_string()
-                            } else if indicators.rsi_14.map_or(false, |rsi| rsi < 30.0) {
-                                "Oversold (<30)".to_string()
-                            } else {
-                                "Neutral".to_string()
-                            },
-                        ),
+                        Cell::from(format!("{:.2}", indicators.rsi_14.unwrap_or(0.0))),
+                        Cell::from(if indicators.rsi_14.map_or(false, |rsi| rsi > 70.0) {
+                            "Overbought (>70)".to_string()
+                        } else if indicators.rsi_14.map_or(false, |rsi| rsi < 30.0) {
+                            "Oversold (<30)".to_string()
+                        } else {
+                            "Neutral".to_string()
+                        }),
                     ]),
                     Row::new(vec![
                         Cell::from("MACD"),
@@ -990,13 +1030,15 @@ impl Dashboard {
                             indicators.bollinger_lower.unwrap_or(0.0)
                         )),
                         Cell::from(
-                            if indicators.bollinger_upper.map_or(false, |upper| {
-                                current_price > upper
-                            }) {
+                            if indicators
+                                .bollinger_upper
+                                .map_or(false, |upper| current_price > upper)
+                            {
                                 "Above Upper Band".to_string()
-                            } else if indicators.bollinger_lower.map_or(false, |lower| {
-                                current_price < lower
-                            }) {
+                            } else if indicators
+                                .bollinger_lower
+                                .map_or(false, |lower| current_price < lower)
+                            {
                                 "Below Lower Band".to_string()
                             } else {
                                 "Within Bands".to_string()
@@ -1059,23 +1101,21 @@ impl Dashboard {
                     };
 
                     let header = Paragraph::new(Text::from(vec![
-                        Line::from(vec![
-                            Span::styled(
-                                format!("{} Price Chart ({})", symbol, timeframe.as_str()),
-                                Style::default()
-                                    .fg(Color::LightCyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
+                        Line::from(vec![Span::styled(
+                            format!("{} Price Chart ({})", symbol, timeframe.as_str()),
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )]),
                         Line::from(vec![
                             Span::raw("Current: "),
                             Span::styled(
-                                format_price(&current_price.to_string()),
+                                Self::format_price(&current_price.to_string()),
                                 Style::default().fg(Color::Yellow),
                             ),
-                            Span::raw(" ("),
+                            ratatui::prelude::Span::raw(" ("),
                             Span::styled(
-                                format_change(&price_change.to_string()),
+                                Self::format_change(&price_change.to_string()),
                                 Style::default().fg(change_color),
                             ),
                             Span::raw(")"),
@@ -1093,100 +1133,6 @@ impl Dashboard {
         let message = Paragraph::new("No symbol selected or insufficient data for chart")
             .block(Block::default().borders(Borders::ALL).title("Chart"));
         f.render_widget(message, area);
-    }
-
-    fn render_line_chart(
-        &self,
-        f: &mut Frame<CrosstermBackend<io::Stdout>>,
-        area: Rect,
-        symbol: &str,
-        data: &SymbolData,
-    ) {
-        if data.prices.len() < 2 {
-            let message = Paragraph::new("Insufficient data for chart")
-                .block(Block::default().borders(Borders::ALL));
-            f.render_widget(message, area);
-            return;
-        }
-
-        let min_price = data.prices.iter().map(|p| p.price).fold(f64::INFINITY, f64::min);
-        let max_price = data.prices.iter().map(|p| p.price).fold(0.0, f64::max);
-        let price_range = max_price - min_price;
-
-        if price_range <= 0.0 {
-            let message = Paragraph::new("No price variation to display")
-                .block(Block::default().borders(Borders::ALL));
-            f.render_widget(message, area);
-            return;
-        }
-
-        let chart_block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!("{} Price History", symbol));
-
-
-        let inner_area = chart_block.inner(area);
-        if inner_area.height < 3 || inner_area.width < 10 {
-            return;
-        }
-        f.render_widget(chart_block, area);
-
-        let height = inner_area.height as f64;
-        let width = inner_area.width as f64;
-        let step = (data.prices.len() as f64 / width).ceil() as usize;
-        let points: Vec<(f64, f64)> = data.prices
-            .iter()
-            .enumerate()
-            .step_by(step)
-            .map(|(i, p)| {
-                let x = (i as f64 / step as f64).min(width - 1.0);
-                let y = height - 1.0 - ((p.price - min_price) / price_range * (height - 2.0));
-                (x, y)
-            })
-            .collect();
-
-        for window in points.windows(2) {
-            if let [(x1, y1), (x2, y2)] = window {
-                let start_x = inner_area.x + x1.round() as u16;
-                let start_y = inner_area.y + y1.round() as u16;
-                let end_x = inner_area.x + x2.round() as u16;
-                let end_y = inner_area.y + y2.round() as u16;
-
-                if start_x == end_x && start_y == end_y {
-                    let dot = Paragraph::new("◉")
-                        .style(Style::default().fg(Color::LightBlue));
-                    f.render_widget(dot, Rect::new(start_x, start_y, 1, 1));
-                } else {
-                    let mut x = start_x;
-                    let mut y = start_y;
-                    let dx = end_x as i16 - start_x as i16;
-                    let dy = end_y as i16 - start_y as i16;
-                    let step = dx.abs().max(dy.abs());
-
-                    for _ in 0..=step {
-                        let dot = Paragraph::new("▪")
-                            .style(Style::default().fg(Color::LightBlue));
-                        f.render_widget(dot, Rect::new(x, y, 1, 1));
-                        x = (x as i16 + dx / step) as u16;
-                        y = (y as i16 + dy / step) as u16;
-                    }
-                }
-            }
-        }
-
-        let top_label = Paragraph::new(format!("{:.2}", max_price))
-            .style(Style::default().fg(Color::Gray));
-        let bottom_label = Paragraph::new(format!("{:.2}", min_price))
-            .style(Style::default().fg(Color::Gray));
-
-        f.render_widget(
-            top_label,
-            Rect::new(inner_area.right() - 8, inner_area.y, 8, 1),
-        );
-        f.render_widget(
-            bottom_label,
-            Rect::new(inner_area.right() - 8, inner_area.bottom() - 1, 8, 1),
-        );
     }
 
     fn render_candles_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
@@ -1208,33 +1154,31 @@ impl Dashboard {
 
                     let current_candle = data.candles.back().unwrap();
                     let header = Paragraph::new(Text::from(vec![
-                        Line::from(vec![
-                            Span::styled(
-                                format!("{} Candles ({})", symbol, timeframe.as_str()),
-                                Style::default()
-                                    .fg(Color::LightCyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
+                        Line::from(vec![Span::styled(
+                            format!("{} Candles ({})", symbol, timeframe.as_str()),
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )]),
                         Line::from(vec![
                             Span::raw("O: "),
                             Span::styled(
-                                format_price(&current_candle.open.to_string()),
+                                Self::format_price(&current_candle.open.to_string()),
                                 Style::default().fg(Color::Yellow),
                             ),
                             Span::raw(" H: "),
                             Span::styled(
-                                format_price(&current_candle.high.to_string()),
+                                Self::format_price(&current_candle.high.to_string()),
                                 Style::default().fg(Color::Green),
                             ),
                             Span::raw(" L: "),
                             Span::styled(
-                                format_price(&current_candle.low.to_string()),
+                                Self::format_price(&current_candle.low.to_string()),
                                 Style::default().fg(Color::Red),
                             ),
                             Span::raw(" C: "),
                             Span::styled(
-                                format_price(&current_candle.close.to_string()),
+                                Self::format_price(&current_candle.close.to_string()),
                                 Style::default().fg(
                                     if current_candle.close >= current_candle.open {
                                         Color::Green
@@ -1259,105 +1203,365 @@ impl Dashboard {
         f.render_widget(message, area);
     }
 
-    fn render_candle_chart(
-        &self,
-        f: &mut Frame<CrosstermBackend<io::Stdout>>,
-        area: Rect,
-        symbol: &str,
-        data: &SymbolData,
-    ) {
-        if data.candles.len() < 2 {
-            let message = Paragraph::new("Insufficient data for candles")
-                .block(Block::default().borders(Borders::ALL));
-            f.render_widget(message, area);
-            return;
-        }
+    fn render_latency_view(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let latency_data = self.latency_data.lock().unwrap();
+        let selected = *self.selected.lock().unwrap();
+        let display_mode = *self.latency_display_mode.lock().unwrap();
 
-        let min_price = data.candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
-        let max_price = data.candles.iter().map(|c| c.high).fold(0.0, f64::max);
-        let price_range = max_price - min_price;
+        // Spliting area into table and chart sections
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(10), Constraint::Min(5)])
+            .split(area);
 
-        if price_range <= 0.0 {
-            let message = Paragraph::new("No price variation to display")
-                .block(Block::default().borders(Borders::ALL));
-            f.render_widget(message, area);
-            return;
-        }
+        // Always render the table at the top
+        self.render_latency_table(f, chunks[0], &latency_data, selected);
 
-        let chart_block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!("{} Candles", symbol));
+        // Render either line chart or sparkline based on display mode
+        if let Some(symbol) = latency_data.keys().nth(selected) {
+            if let Some(data) = latency_data.get(symbol) {
+                if !data.is_empty() {
+                    let max_latency = data.iter().map(|l| l.processing_time).max().unwrap_or(100) as f64;
+                    let range = max_latency.max(10.0);
 
-
-        let inner_area = chart_block.inner(area);
-        if inner_area.height < 3 || inner_area.width < 10 {
-            return;
-        }
-        f.render_widget(chart_block, area);
-
-        let candle_width = (inner_area.width as f32 / data.candles.len() as f32).max(1.0) as u16;
-        let candle_spacing = 1;
-
-        for (i, candle) in data.candles.iter().enumerate() {
-            let x = inner_area.x + (i as u16 * (candle_width + candle_spacing));
-            if x >= inner_area.right() {
-                break;
-            }
-
-            let open_y = inner_area.y + (inner_area.height - 1) -
-                (((candle.open - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
-            let close_y = inner_area.y + (inner_area.height - 1) -
-                (((candle.close - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
-            let high_y = inner_area.y + (inner_area.height - 1) -
-                (((candle.high - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
-            let low_y = inner_area.y + (inner_area.height - 1) -
-                (((candle.low - min_price) / price_range) * (inner_area.height - 1) as f64).round() as u16;
-
-            let is_bullish = candle.close >= candle.open;
-            let color = if is_bullish { Color::Green } else { Color::Red };
-
-            // Draw wick (high to low)
-            for y in low_y..=high_y {
-                let wick = Paragraph::new("│")
-                    .style(Style::default().fg(color));
-                f.render_widget(
-                    wick,
-                    Rect::new(x + candle_width / 2, y, 1, 1),
-                );
-            }
-
-            // Draw body
-            let (top, bottom) = if is_bullish {
-                (close_y, open_y)
-            } else {
-                (open_y, close_y)
-            };
-
-            for y in bottom..=top {
-                for w in 0..candle_width {
-                    let body = Paragraph::new("█")
-                        .style(Style::default().fg(color));
-                    f.render_widget(
-                        body,
-                        Rect::new(x + w, y, 1, 1),
-                    );
+                    match display_mode {
+                        LatencyDisplayMode::LineChart => {
+                            self.render_latency_line_chart(f, chunks[1], symbol, data, range);
+                        }
+                        LatencyDisplayMode::Sparkline => {
+                            self.render_sparkline_chart(f, chunks[1], symbol, data, range);
+                        }
+                    }
+                    return;
                 }
             }
         }
 
-        let top_label = Paragraph::new(format!("{:.2}", max_price))
-            .style(Style::default().fg(Color::Gray));
-        let bottom_label = Paragraph::new(format!("{:.2}", min_price))
-            .style(Style::default().fg(Color::Gray));
+        // Fallback if no data
+        let message = Paragraph::new("No latency data available for chart")
+            .block(Block::default().borders(Borders::ALL).title("Chart"));
+        f.render_widget(message, chunks[1]);
+    }
 
-        f.render_widget(
-            top_label,
-            Rect::new(inner_area.right() - 8, inner_area.y, 8, 1),
-        );
-        f.render_widget(
-            bottom_label,
-            Rect::new(inner_area.right() - 8, inner_area.bottom() - 1, 8, 1),
-        );
+    fn render_latency_table(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        latency_data: &HashMap<String, VecDeque<LatencyData>>,
+        selected: usize,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Latency Metrics");
+
+        let inner_area = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner_area.height < 3 || inner_area.width < 30 {
+            return;
+        }
+
+        let mut symbols: Vec<String> = latency_data.keys().cloned().collect();
+        symbols.sort();
+
+        let rows = symbols.iter().enumerate().map(|(i, symbol)| {
+            let is_selected = i == selected;
+            let data = latency_data.get(symbol);
+
+            let avg_latency = data.map_or(0.0, |d| {
+                if d.is_empty() {
+                    0.0
+                } else {
+                    d.iter().map(|l| l.processing_time as f64).sum::<f64>() / d.len() as f64
+                }
+            });
+
+            let max_latency = data.map_or(0.0, |d| {
+                d.iter().map(|l| l.processing_time).max().unwrap_or(0) as f64
+            });
+
+            Row::new(vec![
+                Cell::from(symbol.as_str()),
+                Cell::from(format!("{:.1} ms", avg_latency)),
+                Cell::from(format!("{:.1} ms", max_latency)),
+                Cell::from(format!("{}", data.map_or(0, |d| d.len()))),
+            ])
+                .style(if is_selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                })
+        });
+
+        let table = Table::new(rows)
+            .header(
+                Row::new(vec!["Symbol", "Avg", "Max", "Samples"])
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            )
+            .widths(&[
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ]);
+
+        f.render_widget(table, inner_area);
+    }
+    fn render_latency_graph(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        let latency_data = self.latency_data.lock().unwrap();
+        let selected = *self.selected.lock().unwrap();
+
+        // Spliting the area into header and chart
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(5)])
+            .split(area);
+
+        if let Some(symbol) = latency_data.keys().nth(selected) {
+            if let Some(data) = latency_data.get(symbol) {
+                if !data.is_empty() {
+                    // Calculate stats
+                    let current_latency = data.back().unwrap().processing_time;
+                    let avg_latency = data.iter().map(|l| l.processing_time as f64).sum::<f64>()
+                        / data.len() as f64;
+                    let max_latency =
+                        data.iter().map(|l| l.processing_time).max().unwrap_or(100) as f64;
+                    let min_latency = 0.0;
+                    let range = (max_latency - min_latency).max(10.0); // Minimum 10ms range for visibility
+
+                    // Render header
+                    let header = Paragraph::new(Text::from(vec![
+                        Line::from(vec![Span::styled(
+                            format!("{} Latency", symbol),
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )]),
+                        Line::from(vec![
+                            Span::raw("Current: "),
+                            Span::styled(
+                                format!("{} ms", current_latency),
+                                Style::default().fg(if current_latency > 100 {
+                                    Color::Red
+                                } else if current_latency > 50 {
+                                    Color::Yellow
+                                } else {
+                                    Color::Green
+                                }),
+                            ),
+                            Span::raw(" Avg: "),
+                            Span::styled(
+                                format!("{:.1} ms", avg_latency),
+                                Style::default().fg(Color::Green),
+                            ),
+                            Span::raw(" Max: "),
+                            Span::styled(
+                                format!("{:.1} ms", max_latency),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ]),
+                    ]))
+                        .block(Block::default().borders(Borders::NONE));
+
+                    f.render_widget(header, chunks[0]);
+
+                    // Render the actual chart
+                    self.render_latency_line_chart(f, chunks[1], symbol, data, range);
+                    return;
+                }
+            }
+        }
+
+        // Fallback if no data
+        let message = Paragraph::new("No latency data available")
+            .block(Block::default().borders(Borders::ALL).title("Latency"));
+        f.render_widget(message, area);
+    }
+
+    fn render_latency_line_chart(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        symbol: &str,
+        data: &VecDeque<LatencyData>,
+        range: f64,
+    ) {
+        // Early return for insufficient data
+        if data.len() < 2 {
+            let message = Paragraph::new("Insufficient data points for chart")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        // 1. Enhanced chart block with better styling
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Gray))
+            .title(format!("{} Latency (ms)", symbol))
+            .title_alignment(Alignment::Center);
+
+        let inner_area = chart_block.inner(area);
+
+        // Early return if area too small
+        if inner_area.height < 3 || inner_area.width < 10 {
+            return;
+        }
+
+        f.render_widget(chart_block, area);
+
+        let height = inner_area.height as f64;
+        let width = inner_area.width as f64;
+
+        // 2. Dynamic step calculation for better rendering
+        let step = (data.len() as f64 / width as f64).ceil() as usize;
+        let step = step.max(1); // Ensure at least 1
+
+        // 3. Improved Y-axis labels
+        let y_axis_labels = vec![
+            (0, format!("{:.0}", range)),                           // Top
+            (inner_area.height / 2, format!("{:.0}", range / 2.0)), // Middle
+            (inner_area.height - 1, "0".to_string()),               // Bottom
+        ];
+
+        for (y, label) in y_axis_labels {
+            let label_widget = Paragraph::new(label).style(Style::default().fg(Color::DarkGray));
+            f.render_widget(
+                label_widget,
+                Rect::new(inner_area.right() - 5, inner_area.y + y, 5, 1),
+            );
+        }
+
+        // 4. Threshold lines for visual reference
+        let warning_threshold = (height * 0.7) as u16; // 70% of height
+        let critical_threshold = (height * 0.9) as u16; // 90% of height
+
+        // Draw threshold lines
+        for (y, color, label) in [
+            (warning_threshold, Color::Yellow, "Warning"),
+            (critical_threshold, Color::Red, "Critical"),
+        ] {
+            let line = Line::from(vec![
+                Span::styled(
+                    "─".repeat(inner_area.width as usize),
+                    Style::default().fg(color),
+                ),
+                Span::styled(
+                    label,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+
+            f.render_widget(
+                Paragraph::new(line),
+                Rect::new(inner_area.x, inner_area.y + y, inner_area.width, 1),
+            );
+        }
+
+        // 5. More efficient point calculation and rendering
+        let points: Vec<(u16, u16)> = data
+            .iter()
+            .enumerate()
+            .step_by(step)
+            .map(|(i, l)| {
+                let x = inner_area.x + (i as f64 / data.len() as f64 * width as f64).round() as u16;
+                let y = inner_area.y
+                    + (height - 1.0 - (l.processing_time as f64 / range * (height - 2.0))) as u16;
+                (x, y)
+            })
+            .collect();
+
+        // 6. Use Sparkline for smoother rendering
+        if let Some(sparkline) = self.create_sparkline(&points, range) {
+            f.render_widget(sparkline, inner_area);
+        }
+
+        // 7. Enhanced current value marker
+        if let Some(last) = data.back() {
+            let default_point = (inner_area.right(), inner_area.bottom());
+            let last_point = points.last().unwrap_or(&default_point);
+            let marker =
+                Paragraph::new("◉").style(Style::default().fg(match last.processing_time {
+                    t if t > 100 => Color::Red,
+                    t if t > 50 => Color::Yellow,
+                    _ => Color::Green,
+                }));
+            f.render_widget(marker, Rect::new(last_point.0, last_point.1, 1, 1));
+
+            // Add value label
+            let value_label = Paragraph::new(format!("{}ms", last.processing_time))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(
+                value_label,
+                Rect::new(last_point.0.saturating_sub(5), last_point.1, 10, 1),
+            );
+        }
+    }
+
+    // Helper function for sparkline creation
+    fn create_sparkline(&self, points: &[(u16, u16)], max_value: f64) -> Option<Sparkline<'static>> {
+        if points.is_empty() {
+            return None;
+        }
+
+        // Create the data vector with proper name
+        let data: Vec<u64> = points.iter()
+            .map(|(_, y)| *y as u64)
+            .collect();
+
+        Some(
+            Sparkline::default()
+                .data(data.leak()) // Convert to 'static lifetime
+                .max(max_value as u64)
+                .style(Style::default().fg(Color::LightBlue))
+                .bar_set(ratatui::symbols::bar::NINE_LEVELS)
+        )
+    }
+    fn render_sparkline_chart(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        symbol: &str,
+        data: &VecDeque<LatencyData>,
+        range: f64,
+    ) {
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("{} Latency (Sparkline)", symbol));
+
+        let inner_area = chart_block.inner(area);
+        f.render_widget(chart_block, area);
+
+        // Convert latency data to points
+        let points: Vec<(u16, u16)> = data
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let x = (i as f64 / data.len() as f64 * inner_area.width as f64).round() as u16;
+                let y =
+                    (l.processing_time as f64 / range * inner_area.height as f64).round() as u16;
+                (x, y)
+            })
+            .collect();
+
+        if let Some(sparkline) = self.create_sparkline(&points, range) {
+            f.render_widget(sparkline, inner_area);
+        }
+    }
+    fn render_main_content(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+        match *self.current_view.lock().unwrap() {
+            DashboardView::Prices => self.render_prices_view(f, area),
+            DashboardView::Alerts => self.render_alerts_view(f, area),
+            DashboardView::Portfolio => self.render_portfolio_view(f, area),
+            DashboardView::Exchanges => self.render_exchanges_view(f, area),
+            DashboardView::Indicators => self.render_indicators_view(f, area),
+            DashboardView::Chart => self.render_chart_view(f, area),
+            DashboardView::Candles => self.render_candles_view(f, area),
+            DashboardView::Latency => self.render_latency_view(f, area),
+        }
     }
 
     fn render_footer(&self, f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
@@ -1390,6 +1594,8 @@ impl Dashboard {
                 Span::raw(" Timeframe  "),
                 Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Quit"),
+                Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Latency  "),
             ],
             DashboardView::Chart | DashboardView::Candles => vec![
                 Span::raw("Controls: "),
@@ -1400,6 +1606,33 @@ impl Dashboard {
                 Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" Quit"),
             ],
+            DashboardView::Latency => {
+                let display_mode = *self.latency_display_mode.lock().unwrap();
+                let zoom = *self.latency_zoom.lock().unwrap();
+
+                vec![
+                    Span::raw("Mode: "),
+                    Span::styled(
+                        format!("{:?} ", display_mode),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("Zoom: "),
+                    ratatui::prelude::Span::styled(format!("{} ", zoom), Style::default().fg(Color::Yellow)),
+                    Span::raw("Controls: "),
+                    Span::styled("←/→", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Navigate "),
+                    Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Toggle "),
+                    Span::styled("h", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Thresholds "),
+                    Span::styled("z", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Zoom "),
+                    Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" Quit"),
+                ]
+            }
             _ => vec![
                 Span::raw("Controls: "),
                 Span::styled("v", Style::default().add_modifier(Modifier::BOLD)),
@@ -1415,39 +1648,234 @@ impl Dashboard {
 
         f.render_widget(footer, area);
     }
-}
 
-fn format_price(price: &str) -> String {
-    price.parse::<f64>().map_or_else(
-        |_| format!("{:>10}", price),
-        |num| {
-            if num > 1000.0 {
-                format!("${:>10.2}", num)
-            } else {
-                format!("${:>10.4}", num)
+
+    fn render_line_chart(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        symbol: &str,
+        data: &SymbolData,
+    ) {
+        if data.prices.len() < 2 {
+            let message = Paragraph::new("Insufficient data for chart")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let min_price = data
+            .prices
+            .iter()
+            .map(|p| p.price)
+            .fold(f64::INFINITY, f64::min);
+        let max_price = data.prices.iter().map(|p| p.price).fold(0.0, f64::max);
+        let price_range = max_price - min_price;
+
+        if price_range <= 0.0 {
+            let message = Paragraph::new("No price variation to display")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("{} Price History", symbol));
+
+        let inner_area = chart_block.inner(area);
+        if inner_area.height < 3 || inner_area.width < 10 {
+            return;
+        }
+        f.render_widget(chart_block, area);
+
+        let height = inner_area.height as f64;
+        let width = inner_area.width as f64;
+        let step = (data.prices.len() as f64 / width).ceil() as usize;
+        let points: Vec<(f64, f64)> = data
+            .prices
+            .iter()
+            .enumerate()
+            .step_by(step)
+            .map(|(i, p)| {
+                let x = (i as f64 / step as f64).min(width - 1.0);
+                let y = height - 1.0 - ((p.price - min_price) / price_range * (height - 2.0));
+                (x, y)
+            })
+            .collect();
+
+        for window in points.windows(2) {
+            if let [(x1, y1), (x2, y2)] = window {
+                let start_x = inner_area.x + x1.round() as u16;
+                let start_y = inner_area.y + y1.round() as u16;
+                let end_x = inner_area.x + x2.round() as u16;
+                let end_y = inner_area.y + y2.round() as u16;
+
+                if start_x == end_x && start_y == end_y {
+                    let dot = Paragraph::new("◉").style(Style::default().fg(Color::LightBlue));
+                    f.render_widget(dot, Rect::new(start_x, start_y, 1, 1));
+                } else {
+                    let mut x = start_x;
+                    let mut y = start_y;
+                    let dx = end_x as i16 - start_x as i16;
+                    let dy = end_y as i16 - start_y as i16;
+                    let step = dx.abs().max(dy.abs());
+
+                    for _ in 0..=step {
+                        let dot = Paragraph::new("▪").style(Style::default().fg(Color::LightBlue));
+                        f.render_widget(dot, Rect::new(x, y, 1, 1));
+                        x = (x as i16 + dx / step) as u16;
+                        y = (y as i16 + dy / step) as u16;
+                    }
+                }
             }
-        },
-    )
-}
+        }
 
-fn format_change(change: &str) -> String {
-    change.parse::<f64>().map_or_else(
-        |_| format!("{:>7}", change),
-        |c| format!("{:>7.2}%", c),
-    )
-}
+        let top_label =
+            Paragraph::new(format!("{:.2}", max_price)).style(Style::default().fg(Color::Gray));
+        let bottom_label =
+            Paragraph::new(format!("{:.2}", min_price)).style(Style::default().fg(Color::Gray));
 
-fn format_volume(volume: &str) -> String {
-    volume.parse::<f64>().map_or_else(
-        |_| format!("{:>15}", volume),
-        |v| {
-            if v > 1_000_000.0 {
-                format!("{:>10.2}M", v / 1_000_000.0)
-            } else if v > 1_000.0 {
-                format!("{:>10.2}K", v / 1_000.0)
-            } else {
-                format!("{:>10.2}", v)
+        f.render_widget(
+            top_label,
+            Rect::new(inner_area.right() - 8, inner_area.y, 8, 1),
+        );
+        f.render_widget(
+            bottom_label,
+            Rect::new(inner_area.right() - 8, inner_area.bottom() - 1, 8, 1),
+        );
+    }
+    fn render_candle_chart(
+        &self,
+        f: &mut Frame<CrosstermBackend<io::Stdout>>,
+        area: Rect,
+        symbol: &str,
+        data: &SymbolData,
+    ) {
+        if data.candles.len() < 2 {
+            let message = Paragraph::new("Insufficient data for candles")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let min_price = data
+            .candles
+            .iter()
+            .map(|c| c.low)
+            .fold(f64::INFINITY, f64::min);
+        let max_price = data.candles.iter().map(|c| c.high).fold(0.0, f64::max);
+        let price_range = max_price - min_price;
+
+        if price_range <= 0.0 {
+            let message = Paragraph::new("No price variation to display")
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(message, area);
+            return;
+        }
+
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("{} Candles", symbol));
+
+        let inner_area = chart_block.inner(area);
+        if inner_area.height < 3 || inner_area.width < 10 {
+            return;
+        }
+        f.render_widget(chart_block, area);
+
+        let candle_width = (inner_area.width as f32 / data.candles.len() as f32).max(1.0) as u16;
+        let candle_spacing = 1;
+
+        for (i, candle) in data.candles.iter().enumerate() {
+            let x = inner_area.x + (i as u16 * (candle_width + candle_spacing));
+            if x >= inner_area.right() {
+                break;
             }
-        },
-    )
+
+            let open_y = inner_area.y + (inner_area.height - 1)
+                - (((candle.open - min_price) / price_range) * (inner_area.height - 1) as f64).round()
+                as u16;
+            let close_y = inner_area.y + (inner_area.height - 1)
+                - (((candle.close - min_price) / price_range) * (inner_area.height - 1) as f64).round()
+                as u16;
+            let high_y = inner_area.y + (inner_area.height - 1)
+                - (((candle.high - min_price) / price_range) * (inner_area.height - 1) as f64).round()
+                as u16;
+            let low_y = inner_area.y + (inner_area.height - 1)
+                - (((candle.low - min_price) / price_range) * (inner_area.height - 1) as f64).round()
+                as u16;
+
+            let is_bullish = candle.close >= candle.open;
+            let color = if is_bullish { Color::Green } else { Color::Red };
+
+            // Draw wick (high to low)
+            for y in low_y..=high_y {
+                let wick = Paragraph::new("│").style(Style::default().fg(color));
+                f.render_widget(wick, Rect::new(x + candle_width / 2, y, 1, 1));
+            }
+
+            // Draw body
+            let (top, bottom) = if is_bullish {
+                (close_y, open_y)
+            } else {
+                (open_y, close_y)
+            };
+
+            for y in bottom..=top {
+                for w in 0..candle_width {
+                    let body = Paragraph::new("█").style(Style::default().fg(color));
+                    f.render_widget(body, Rect::new(x + w, y, 1, 1));
+                }
+            }
+        }
+
+        let top_label =
+            Paragraph::new(format!("{:.2}", max_price)).style(Style::default().fg(Color::Gray));
+        let bottom_label =
+            Paragraph::new(format!("{:.2}", min_price)).style(Style::default().fg(Color::Gray));
+
+        f.render_widget(
+            top_label,
+            Rect::new(inner_area.right() - 8, inner_area.y, 8, 1),
+        );
+        f.render_widget(
+            bottom_label,
+            Rect::new(inner_area.right() - 8, inner_area.bottom() - 1, 8, 1),
+        );
+    }
+    fn format_price(price: &str) -> String {
+        price.parse::<f64>().map_or_else(
+            |_| format!("{:>10}", price),
+            |num| {
+                if num > 1000.0 {
+                    format!("${:>10.2}", num)
+                } else {
+                    format!("${:>10.4}", num)
+                }
+            },
+        )
+    }
+
+    fn format_change(change: &str) -> String {
+        change
+            .parse::<f64>()
+            .map_or_else(|_| format!("{:>7}", change), |c| format!("{:>7.2}%", c),
+            )
+    }
+
+    fn format_volume(volume: &str) -> String {
+        volume.parse::<f64>().map_or_else(
+            |_| format!("{:>15}", volume),
+            |v| {
+                if v > 1_000_000.0 {
+                    format!("{:>10.2}M", v / 1_000_000.0)
+                } else if v > 1_000.0 {
+                    format!("{:>10.2}K", v / 1_000.0)
+                } else {
+                    format!("{:>10.2}", v)
+                }
+            },
+        )
+    }
 }
