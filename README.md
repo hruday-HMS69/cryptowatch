@@ -26,9 +26,16 @@ A real-time cryptocurrency market monitor and trading dashboard built with Rust,
    - RSI and MACD indicators  
    - Price history visualization  
 
-✔ **Alerts System**  
+✔**Alerts System**  
    - Price threshold notifications  
-   - Percentage change triggers  
+   - Percentage change triggers
+     
+✔**Keyboard-Driven Interface**
+   - View switching: v (Prices), a (Alerts), p (Portfolio), c/k (Chart/Candles), i (Indicators), l (Latency)
+   - Buy/Sell: b, x
+   - Sorting & navigation: ↑ ↓ s
+   - Timeframe cycling: t
+   - Quit: q
 
 ## Installation
 
@@ -78,3 +85,7 @@ Customizable themes
 Multiple layout modes
 
 Exportable reports
+
+
+
+Made with Rust and caffeine by Hruday. Pull requests and contributions welcome!
